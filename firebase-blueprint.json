@@ -1,0 +1,404 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "Multiplayer WortBlitz game room state, settings, active theme, and round progress.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "4-character room code.",
+          "minLength": 4,
+          "maxLength": 4,
+          "pattern": "^[0-9]{4}$"
+        },
+        "hostUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the room host.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": ["LOBBY", "COUNTDOWN", "PLAYING", "ROUND_END", "GAME_OVER"],
+          "description": "Current lifecycle state of the room."
+        },
+        "maxPlayers": {
+          "type": "integer",
+          "description": "Maximum allowed players (2 to 8)."
+        },
+        "turnMode": {
+          "type": "string",
+          "enum": ["SIMULTANEOUS", "TURN_BASED"],
+          "description": "Turn flow mode."
+        },
+        "ruleVariant": {
+          "type": "string",
+          "enum": ["CLASSIC", "CHAOS"],
+          "description": "Game ruleset variant."
+        },
+        "penaltyEnabled": {
+          "type": "boolean",
+          "description": "Whether invalid words draw +1 penalty card."
+        },
+        "roundDurationSec": {
+          "type": "integer",
+          "description": "Countdown timer duration per theme (15, 20, or 30 seconds)."
+        },
+        "targetScore": {
+          "type": "integer",
+          "description": "Points required to win the match (default 10)."
+        },
+        "selectedCategory": {
+          "type": "string",
+          "description": "Name of the active theme deck.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "deckThemes": {
+          "type": "array",
+          "description": "Ordered list of themes for the match (max 80)."
+        },
+        "currentThemeIndex": {
+          "type": "integer",
+          "description": "Index of the current theme in deckThemes."
+        },
+        "currentTheme": {
+          "type": "string",
+          "description": "Currently active topic string.",
+          "maxLength": 120
+        },
+        "roundNumber": {
+          "type": "integer",
+          "description": "Current round number starting at 0 in lobby."
+        },
+        "turnEndsAt": {
+          "type": "number",
+          "description": "Epoch milliseconds when the current timer expires."
+        },
+        "activeTurnUid": {
+          "type": "string",
+          "description": "UID of active player in TURN_BASED mode, or empty string.",
+          "maxLength": 128
+        },
+        "playerOrder": {
+          "type": "array",
+          "description": "Ordered array of joined player UIDs (max 8)."
+        },
+        "usedWords": {
+          "type": "array",
+          "description": "Normalized words already accepted for the current theme (max 100)."
+        },
+        "winnersOrder": {
+          "type": "array",
+          "description": "UIDs of players in the order they emptied their hands this round (max 8)."
+        },
+        "lastActionNotice": {
+          "type": "string",
+          "description": "Latest game action announcement.",
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "code",
+        "hostUid",
+        "status",
+        "maxPlayers",
+        "turnMode",
+        "ruleVariant",
+        "penaltyEnabled",
+        "roundDurationSec",
+        "targetScore",
+        "selectedCategory",
+        "deckThemes",
+        "currentThemeIndex",
+        "currentTheme",
+        "roundNumber",
+        "turnEndsAt",
+        "activeTurnUid",
+        "playerOrder",
+        "usedWords",
+        "winnersOrder",
+        "lastActionNotice",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Player": {
+      "title": "Player",
+      "description": "A participant in a WortBlitz room, including their private card hand and score.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "description": "Player display nickname.",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "avatar": {
+          "type": "string",
+          "description": "Avatar identifier.",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "isJunior": {
+          "type": "boolean",
+          "description": "Junior / beginner mode flag (7 starting cards + lenient AI judging)."
+        },
+        "cards": {
+          "type": "array",
+          "description": "Player letter cards (e.g. A..Z or JOKER, max 25)."
+        },
+        "cardCount": {
+          "type": "integer",
+          "description": "Remaining letter card count."
+        },
+        "actionCards": {
+          "type": "array",
+          "description": "Remaining Chaos action cards (max 4)."
+        },
+        "score": {
+          "type": "integer",
+          "description": "Total accumulated match score."
+        },
+        "roundDealt": {
+          "type": "integer",
+          "description": "Latest round number dealt to this player."
+        },
+        "finishedRound": {
+          "type": "integer",
+          "description": "Round number in which player emptied their hand, or 0."
+        },
+        "lastScoredRound": {
+          "type": "integer",
+          "description": "Latest round number for which points were claimed."
+        },
+        "secretThemeCount": {
+          "type": "integer",
+          "description": "Number of secret lobby themes submitted by this player (0 to 2)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "name",
+        "avatar",
+        "isJunior",
+        "cards",
+        "cardCount",
+        "actionCards",
+        "score",
+        "roundDealt",
+        "finishedRound",
+        "lastScoredRound",
+        "secretThemeCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SecretTheme": {
+      "title": "SecretTheme",
+      "description": "A secret topic idea submitted in the lobby before game start.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Author UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "hostUid": {
+          "type": "string",
+          "description": "Room host UID for private host retrieval.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "theme": {
+          "type": "string",
+          "description": "Secret topic text.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "hostUid", "theme", "createdAt"]
+    },
+    "FeedEntry": {
+      "title": "FeedEntry",
+      "description": "Live ticker word attempt or action log entry in a room.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Player UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "playerName": {
+          "type": "string",
+          "description": "Player nickname.",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "avatar": {
+          "type": "string",
+          "description": "Player avatar id.",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "word": {
+          "type": "string",
+          "description": "Spoken or played word.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "letter": {
+          "type": "string",
+          "description": "Card letter played (A-Z or JOKER).",
+          "minLength": 1,
+          "maxLength": 10
+        },
+        "theme": {
+          "type": "string",
+          "description": "Theme active during submission.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "roundNumber": {
+          "type": "integer",
+          "description": "Round number."
+        },
+        "valid": {
+          "type": "boolean",
+          "description": "Whether the word was accepted."
+        },
+        "reason": {
+          "type": "string",
+          "description": "AI referee feedback message.",
+          "maxLength": 200
+        },
+        "undone": {
+          "type": "boolean",
+          "description": "Whether the player undid this entry."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "playerName",
+        "avatar",
+        "word",
+        "letter",
+        "theme",
+        "roundNumber",
+        "valid",
+        "reason",
+        "undone",
+        "createdAt"
+      ]
+    },
+    "ChaosEvent": {
+      "title": "ChaosEvent",
+      "description": "Interactive Chaos action card event (e.g. gift card targeting another player).",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["GIFT"],
+          "description": "Chaos action event type."
+        },
+        "fromUid": {
+          "type": "string",
+          "description": "Sender UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "fromName": {
+          "type": "string",
+          "description": "Sender nickname.",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "toUid": {
+          "type": "string",
+          "description": "Target recipient UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "letter": {
+          "type": "string",
+          "description": "Gifted letter card.",
+          "minLength": 1,
+          "maxLength": 10
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "ACCEPTED", "BLOCKED"],
+          "description": "Resolution status."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["type", "fromUid", "fromName", "toUid", "letter", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/Room" },
+      "description": "Game room metadata, configuration, and shared round state."
+    },
+    "/rooms/{roomId}/players/{playerId}": {
+      "schema": { "$ref": "#/entities/Player" },
+      "description": "Player profile, score, and card hand within a room."
+    },
+    "/rooms/{roomId}/secretThemes/{themeId}": {
+      "schema": { "$ref": "#/entities/SecretTheme" },
+      "description": "Secret topic ideas submitted in the lobby."
+    },
+    "/rooms/{roomId}/feed/{entryId}": {
+      "schema": { "$ref": "#/entities/FeedEntry" },
+      "description": "Live word submission ticker."
+    },
+    "/rooms/{roomId}/events/{eventId}": {
+      "schema": { "$ref": "#/entities/ChaosEvent" },
+      "description": "Targeted Chaos card events (such as Karten-Geschenk)."
+    }
+  }
+}
