@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { registerTtsRecognitionBridge } from '../lib/soundAndSpeech';
 
 interface SpeechRecognitionAlternativeLike {
   transcript: string;
@@ -57,6 +58,15 @@ export function useSpeechRecognition({
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const shouldKeepAliveRef = useRef(false);
+  const pausedByTtsRef = useRef(false);
+  const resumeTimerRef = useRef<number | null>(null);
+
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+
   const onFinalRef = useRef(onFinalTranscript);
   onFinalRef.current = onFinalTranscript;
 
@@ -71,6 +81,11 @@ export function useSpeechRecognition({
 
   const stopListening = useCallback(() => {
     shouldKeepAliveRef.current = false;
+    pausedByTtsRef.current = false;
+    if (resumeTimerRef.current !== null) {
+      window.clearTimeout(resumeTimerRef.current);
+      resumeTimerRef.current = null;
+    }
     setInterimText('');
     if (recognitionRef.current) {
       try {
@@ -94,7 +109,11 @@ export function useSpeechRecognition({
     }
 
     setMicError(null);
-    shouldKeepAliveRef.current = mode === 'CONTINUOUS';
+    shouldKeepAliveRef.current = modeRef.current === 'CONTINUOUS';
+
+    if (pausedByTtsRef.current) {
+      return;
+    }
 
     if (recognitionRef.current) {
       try {
@@ -106,7 +125,7 @@ export function useSpeechRecognition({
 
     const recognition = new Ctor();
     recognition.lang = 'de-DE';
-    recognition.continuous = mode === 'CONTINUOUS';
+    recognition.continuous = modeRef.current === 'CONTINUOUS';
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
@@ -116,6 +135,7 @@ export function useSpeechRecognition({
     };
 
     recognition.onresult = (event) => {
+      if (pausedByTtsRef.current) return;
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const res = event.results[i];
@@ -136,10 +156,12 @@ export function useSpeechRecognition({
     recognition.onerror = (event) => {
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         shouldKeepAliveRef.current = false;
-        setMicError('Mikrofon-Zugriff wurde verweigert. Bitte Berechtigung im Browser freigeben.');
+        setMicError(
+          'Mikrofon-Zugriff wurde verweigert. Bitte Berechtigung im Browser freigeben.'
+        );
         setIsListening(false);
       } else if (event.error === 'no-speech' || event.error === 'aborted') {
-        // Normal silence / manual stop
+        // Normal silence / manual or TTS pause stop
       } else {
         setMicError(`Mikrofon-Hinweis: ${event.error}`);
       }
@@ -148,9 +170,19 @@ export function useSpeechRecognition({
     recognition.onend = () => {
       setIsListening(false);
       setInterimText('');
-      if (shouldKeepAliveRef.current && enabled && mode === 'CONTINUOUS') {
-        setTimeout(() => {
-          if (shouldKeepAliveRef.current) {
+      if (
+        !pausedByTtsRef.current &&
+        shouldKeepAliveRef.current &&
+        enabledRef.current &&
+        modeRef.current === 'CONTINUOUS'
+      ) {
+        window.setTimeout(() => {
+          if (
+            !pausedByTtsRef.current &&
+            shouldKeepAliveRef.current &&
+            enabledRef.current &&
+            modeRef.current === 'CONTINUOUS'
+          ) {
             try {
               recognition.start();
             } catch {
@@ -167,7 +199,57 @@ export function useSpeechRecognition({
     } catch {
       // already started
     }
-  }, [enabled, mode]);
+  }, []);
+
+  // Register TTS pause/resume bridge so continuous listening pauses during moderator speech
+  useEffect(() => {
+    registerTtsRecognitionBridge({
+      onStart: () => {
+        if (modeRef.current !== 'CONTINUOUS' || !shouldKeepAliveRef.current) return;
+        pausedByTtsRef.current = true;
+        if (resumeTimerRef.current !== null) {
+          window.clearTimeout(resumeTimerRef.current);
+          resumeTimerRef.current = null;
+        }
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.stop();
+          } catch {
+            // ignore
+          }
+        }
+      },
+      onEnd: () => {
+        if (!pausedByTtsRef.current) return;
+        pausedByTtsRef.current = false;
+        if (
+          enabledRef.current &&
+          modeRef.current === 'CONTINUOUS' &&
+          shouldKeepAliveRef.current
+        ) {
+          resumeTimerRef.current = window.setTimeout(() => {
+            resumeTimerRef.current = null;
+            if (
+              !pausedByTtsRef.current &&
+              enabledRef.current &&
+              modeRef.current === 'CONTINUOUS' &&
+              shouldKeepAliveRef.current
+            ) {
+              startListening();
+            }
+          }, 150);
+        }
+      },
+    });
+
+    return () => {
+      registerTtsRecognitionBridge(null);
+      if (resumeTimerRef.current !== null) {
+        window.clearTimeout(resumeTimerRef.current);
+        resumeTimerRef.current = null;
+      }
+    };
+  }, [startListening]);
 
   useEffect(() => {
     if (!enabled) {

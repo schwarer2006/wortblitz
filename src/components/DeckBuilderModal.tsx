@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
-import { Loader2, Plus, Sparkles, Trash2, X, Check } from 'lucide-react';
+import { Check, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react';
 import { ALL_BUILTIN_CATEGORIES } from '../data/themesAndCards';
+import { generateThemesViaProxy } from '../lib/geminiProxy';
 import type { CustomDeck } from '../types/game';
 
 interface DeckBuilderModalProps {
   isOpen: boolean;
   onClose: () => void;
+  familyPin: string;
   selectedCategory: string;
   customDecks: CustomDeck[];
   onSaveCustomDeck: (deck: CustomDeck) => void;
@@ -16,6 +18,7 @@ interface DeckBuilderModalProps {
 export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
   isOpen,
   onClose,
+  familyPin,
   selectedCategory,
   customDecks,
   onSaveCustomDeck,
@@ -24,13 +27,11 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
 }) => {
   const [tab, setTab] = useState<'BUILTIN' | 'AI' | 'CUSTOM'>('BUILTIN');
 
-  // AI Theme Generator state
   const [aiKeyword, setAiKeyword] = useState('');
   const [aiThemes, setAiThemes] = useState<string[]>([]);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  // Manual Custom Deck editor state
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deckName, setDeckName] = useState('');
   const [deckRawText, setDeckRawText] = useState('');
@@ -48,18 +49,12 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
     setAiLoading(true);
     setAiError(null);
     try {
-      const res = await fetch('/api/generate-themes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keyword }),
-      });
-      const data = (await res.json()) as { themes?: string[]; error?: string };
-      if (!res.ok || !Array.isArray(data.themes)) {
-        throw new Error(data.error || 'Themen konnten nicht generiert werden.');
-      }
-      setAiThemes(data.themes);
-    } catch (err) {
-      setAiError(err instanceof Error ? err.message : 'Fehler bei der KI-Generierung.');
+      const themes = await generateThemesViaProxy(familyPin, keyword);
+      setAiThemes(themes);
+    } catch {
+      setAiError(
+        'Der KI-Themengenerator ist gerade nicht erreichbar. Bitte versuche es gleich nochmal.'
+      );
     } finally {
       setAiLoading(false);
     }
@@ -122,7 +117,6 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
       <div className="w-full sm:max-w-2xl max-h-[90vh] bg-[#161923] border border-white/10 rounded-t-3xl sm:rounded-3xl flex flex-col overflow-hidden shadow-2xl">
-        {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div>
             <h2 className="text-xl font-display font-bold text-white">
@@ -142,7 +136,6 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
           </button>
         </div>
 
-        {/* Segmented Tabs */}
         <div className="px-5 pt-4">
           <div className="grid grid-cols-3 gap-1 p-1 bg-[#0F1117] rounded-xl border border-white/10">
             <button
@@ -181,7 +174,6 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
           </div>
         </div>
 
-        {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
           {tab === 'BUILTIN' && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -229,7 +221,7 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
                     type="text"
                     value={aiKeyword}
                     onChange={(e) => setAiKeyword(e.target.value)}
-                    placeholder="z. B. Weihnachten, 80er-Jahre, Camping, Harry Potter..."
+                    placeholder="z. B. Weihnachten, 80er-Jahre, Camping..."
                     maxLength={60}
                     className="flex-1 min-h-[46px] px-4 rounded-xl bg-[#0F1117] border border-white/15 text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400"
                   />
@@ -246,9 +238,7 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
                     <span>{aiLoading ? 'Generiert…' : 'Erstellen'}</span>
                   </button>
                 </div>
-                {aiError && (
-                  <p className="text-xs text-rose-400">{aiError}</p>
-                )}
+                {aiError && <p className="text-xs text-rose-400">{aiError}</p>}
               </form>
 
               {aiThemes.length > 0 && (
@@ -270,7 +260,7 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
                         onClick={() => handleUseAiDeck(true)}
                         className="min-h-[40px] px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-xs font-semibold text-slate-950 transition-colors"
                       >
-                        Speichern & Aktivieren
+                        Speichern &amp; Aktivieren
                       </button>
                     </div>
                   </div>
@@ -384,16 +374,14 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
                   className="w-full p-4 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400"
                 />
 
-                {customError && (
-                  <p className="text-xs text-rose-400">{customError}</p>
-                )}
+                {customError && <p className="text-xs text-rose-400">{customError}</p>}
 
                 <button
                   type="submit"
                   className="w-full min-h-[46px] px-5 py-3 rounded-xl bg-amber-400 text-slate-950 font-semibold hover:bg-amber-300 flex items-center justify-center gap-2 transition-colors"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>Speichern & Deck auswählen</span>
+                  <span>Speichern &amp; Deck auswählen</span>
                 </button>
               </form>
             </div>

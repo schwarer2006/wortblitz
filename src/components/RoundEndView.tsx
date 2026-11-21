@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, Award, Trophy } from 'lucide-react';
+import { ArrowRight, Award, Bot, Trophy } from 'lucide-react';
 import { calculateRoundPoints, getAvatar } from '../data/themesAndCards';
 import type { PlayerData, RoomData } from '../types/game';
 
 interface RoundEndViewProps {
   room: RoomData;
   myUid: string;
-  myPlayer: PlayerData;
+  myPlayer: PlayerData | null;
   onClaimMyPoints: () => Promise<void>;
+  onHostClaimBotPoints: () => Promise<void>;
   onNextRoundOrFinish: () => Promise<void>;
 }
 
@@ -16,16 +17,23 @@ export const RoundEndView: React.FC<RoundEndViewProps> = ({
   myUid,
   myPlayer,
   onClaimMyPoints,
+  onHostClaimBotPoints,
   onNextRoundOrFinish,
 }) => {
   const isHost = room.hostUid === myUid;
   const [advancing, setAdvancing] = useState(false);
 
   useEffect(() => {
-    if (myPlayer.lastScoredRound < room.roundNumber) {
+    if (myPlayer && myPlayer.lastScoredRound < room.roundNumber) {
       onClaimMyPoints();
     }
-  }, [myPlayer.lastScoredRound, room.roundNumber, onClaimMyPoints]);
+  }, [myPlayer, room.roundNumber, onClaimMyPoints]);
+
+  useEffect(() => {
+    if (isHost) {
+      onHostClaimBotPoints();
+    }
+  }, [isHost, room.roundNumber, onHostClaimBotPoints]);
 
   const sortedPlayers = [...room.playerOrder]
     .map((uid) => room.playersMeta[uid])
@@ -87,11 +95,15 @@ export const RoundEndView: React.FC<RoundEndViewProps> = ({
                     {av.emoji}
                   </div>
                   <div className="min-w-0">
-                    <div className="font-semibold text-sm text-white truncate">
-                      {player.name} {player.uid === myUid ? '(Du)' : ''}
+                    <div className="font-semibold text-sm text-white truncate flex items-center gap-1.5">
+                      <span>
+                        {player.name} {player.uid === myUid ? '(Du)' : ''}
+                      </span>
+                      {player.isBot && <Bot className="w-3.5 h-3.5 text-sky-400 shrink-0" />}
                     </div>
                     <div className="text-xs text-slate-400">
-                      {placeLabel} · {pts > 0 ? `+${pts} Punkte` : '+0 Punkte'}
+                      {placeLabel} ·{' '}
+                      {pts > 0 ? `+${pts} Platz-Bonus` : 'Kein Platz-Bonus'}
                     </div>
                   </div>
                 </div>

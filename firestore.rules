@@ -7,17 +7,12 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // --- Global Primitives ---
     function incoming() {
       return request.resource.data;
     }
 
     function existing() {
       return resource.data;
-    }
-
-    function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
     }
 
     function isValidId(id) {
@@ -32,24 +27,37 @@ service cloud.firestore {
       return arr is list && arr.size() <= maxLen && (arr.size() == 0 || (arr[0] is string && arr[0].size() <= maxItemLen));
     }
 
-    // --- Validation Blueprints ---
+    function isValidAnnouncement(ann) {
+      return ann == null || (
+        ann is map
+        && ann.keys().hasAll(['id', 'text', 'createdAt'])
+        && ann.keys().hasOnly(['id', 'text', 'createdAt'])
+        && ann.id is string && ann.id.size() >= 1 && ann.id.size() <= 64
+        && ann.text is string && ann.text.size() >= 1 && ann.text.size() <= 240
+        && ann.createdAt is number && ann.createdAt > 0
+      );
+    }
+
     function isValidRoom(data, roomId) {
       return data.keys().hasAll([
-          'code', 'hostUid', 'status', 'maxPlayers', 'turnMode', 'ruleVariant',
-          'penaltyEnabled', 'roundDurationSec', 'targetScore', 'selectedCategory',
-          'deckThemes', 'currentThemeIndex', 'currentTheme', 'roundNumber',
-          'turnEndsAt', 'activeTurnUid', 'playerOrder', 'playersMeta',
-          'usedWords', 'winnersOrder', 'lastActionNotice', 'createdAt', 'updatedAt'
+          'code', 'hostUid', 'tableDisplayActive', 'status', 'maxPlayers',
+          'turnMode', 'ruleVariant', 'penaltyEnabled', 'roundDurationSec',
+          'targetScore', 'selectedCategory', 'deckThemes', 'currentThemeIndex',
+          'currentTheme', 'roundNumber', 'turnEndsAt', 'activeTurnUid',
+          'playerOrder', 'playersMeta', 'usedWords', 'winnersOrder',
+          'lastActionNotice', 'createdAtMs', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'code', 'hostUid', 'status', 'maxPlayers', 'turnMode', 'ruleVariant',
-          'penaltyEnabled', 'roundDurationSec', 'targetScore', 'selectedCategory',
-          'deckThemes', 'currentThemeIndex', 'currentTheme', 'roundNumber',
-          'turnEndsAt', 'activeTurnUid', 'playerOrder', 'playersMeta',
-          'usedWords', 'winnersOrder', 'lastActionNotice', 'createdAt', 'updatedAt'
+          'code', 'hostUid', 'tableDisplayActive', 'status', 'maxPlayers',
+          'turnMode', 'ruleVariant', 'penaltyEnabled', 'roundDurationSec',
+          'targetScore', 'selectedCategory', 'deckThemes', 'currentThemeIndex',
+          'currentTheme', 'roundNumber', 'turnEndsAt', 'activeTurnUid',
+          'playerOrder', 'playersMeta', 'usedWords', 'winnersOrder',
+          'lastActionNotice', 'latestAnnouncement', 'createdAtMs', 'createdAt', 'updatedAt'
         ])
         && data.code is string && data.code == roomId && isValidRoomCode(data.code)
         && isValidId(data.hostUid)
+        && data.tableDisplayActive is bool
         && data.status in ['LOBBY', 'COUNTDOWN', 'PLAYING', 'ROUND_END', 'GAME_OVER']
         && data.maxPlayers is int && data.maxPlayers >= 2 && data.maxPlayers <= 8
         && data.turnMode in ['SIMULTANEOUS', 'TURN_BASED']
@@ -69,25 +77,31 @@ service cloud.firestore {
         && isStringList(data.usedWords, 100, 64)
         && isStringList(data.winnersOrder, 8, 128)
         && data.lastActionNotice is string && data.lastActionNotice.size() <= 160
+        && (!('latestAnnouncement' in data) || isValidAnnouncement(data.latestAnnouncement))
+        && data.createdAtMs is number && data.createdAtMs > 0
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
     function isValidPlayer(data, playerId) {
       return data.keys().hasAll([
-          'uid', 'name', 'avatar', 'isJunior', 'cards', 'cardCount',
-          'actionCards', 'score', 'roundDealt', 'finishedRound',
-          'lastScoredRound', 'secretThemeCount', 'createdAt', 'updatedAt'
+          'uid', 'name', 'avatar', 'isJunior', 'isBot', 'botDifficulty',
+          'cards', 'cardCount', 'actionCards', 'score', 'roundDealt',
+          'finishedRound', 'lastScoredRound', 'secretThemeCount',
+          'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'uid', 'name', 'avatar', 'isJunior', 'cards', 'cardCount',
-          'actionCards', 'score', 'roundDealt', 'finishedRound',
-          'lastScoredRound', 'secretThemeCount', 'createdAt', 'updatedAt'
+          'uid', 'name', 'avatar', 'isJunior', 'isBot', 'botDifficulty',
+          'cards', 'cardCount', 'actionCards', 'score', 'roundDealt',
+          'finishedRound', 'lastScoredRound', 'secretThemeCount',
+          'createdAt', 'updatedAt'
         ])
         && data.uid is string && data.uid == playerId && isValidId(data.uid)
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 24
         && data.avatar is string && data.avatar.size() >= 1 && data.avatar.size() <= 24
         && data.isJunior is bool
+        && data.isBot is bool
+        && data.botDifficulty in ['NONE', 'SLOW', 'NORMAL', 'FAST']
         && isStringList(data.cards, 25, 10)
         && data.cardCount is int && data.cardCount >= 0 && data.cardCount <= 25
         && isStringList(data.actionCards, 4, 24)
@@ -103,7 +117,7 @@ service cloud.firestore {
     function isValidSecretTheme(data) {
       return data.keys().hasAll(['uid', 'hostUid', 'theme', 'createdAt'])
         && data.keys().hasOnly(['uid', 'hostUid', 'theme', 'createdAt'])
-        && isValidId(data.uid) && data.uid == request.auth.uid
+        && isValidId(data.uid)
         && isValidId(data.hostUid)
         && data.theme is string && data.theme.size() >= 2 && data.theme.size() <= 80
         && data.createdAt is timestamp;
@@ -118,7 +132,7 @@ service cloud.firestore {
           'uid', 'playerName', 'avatar', 'word', 'letter', 'theme',
           'roundNumber', 'valid', 'reason', 'undone', 'visibleTo', 'createdAt'
         ])
-        && isValidId(data.uid) && data.uid == request.auth.uid
+        && isValidId(data.uid)
         && data.playerName is string && data.playerName.size() >= 1 && data.playerName.size() <= 24
         && data.avatar is string && data.avatar.size() >= 1 && data.avatar.size() <= 24
         && data.word is string && data.word.size() >= 1 && data.word.size() <= 64
@@ -149,184 +163,98 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // --- Collection Rules ---
     match /rooms/{roomId} {
-      allow get: if isSignedIn() && isValidRoomCode(roomId);
-      allow list: if false;
+      allow get: if isValidRoomCode(roomId);
+      allow list: if resource.data.createdAtMs < (request.time.toMillis() - 43200000);
 
-      allow create: if isSignedIn()
-        && isValidRoomCode(roomId)
+      allow create: if isValidRoomCode(roomId)
         && isValidRoom(incoming(), roomId)
-        && incoming().hostUid == request.auth.uid
         && incoming().status == 'LOBBY'
         && incoming().roundNumber == 0
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
-      allow update: if isSignedIn()
-        && isValidRoomCode(roomId)
+      allow update: if isValidRoomCode(roomId)
         && isValidRoom(incoming(), roomId)
         && incoming().code == existing().code
         && incoming().hostUid == existing().hostUid
+        && incoming().createdAtMs == existing().createdAtMs
         && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && (
-          // Action 1: Host manages room setup, start, round progression, rematch
-          (existing().hostUid == request.auth.uid
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'status', 'maxPlayers', 'turnMode', 'ruleVariant', 'penaltyEnabled',
-              'roundDurationSec', 'targetScore', 'selectedCategory', 'deckThemes',
-              'currentThemeIndex', 'currentTheme', 'roundNumber', 'turnEndsAt',
-              'activeTurnUid', 'playerOrder', 'playersMeta', 'usedWords',
-              'winnersOrder', 'lastActionNotice', 'updatedAt'
-            ])
-          )
-          ||
-          // Action 2: Player joins lobby (before game starts)
-          (existing().status == 'LOBBY'
-            && !(request.auth.uid in existing().playerOrder)
-            && existing().playerOrder.size() < existing().maxPlayers
-            && request.auth.uid in incoming().playerOrder
-            && incoming().playerOrder.size() == existing().playerOrder.size() + 1
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'playerOrder', 'playersMeta', 'lastActionNotice', 'updatedAt'
-            ])
-          )
-          ||
-          // Action 3: Joined player updates their own playersMeta (score, cardCount, secretThemeCount)
-          (request.auth.uid in existing().playerOrder
-            && existing().status != 'GAME_OVER'
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'playersMeta', 'updatedAt'
-            ])
-          )
-          ||
-          // Action 4: Joined player plays a valid word or undoes a word during active round
-          (request.auth.uid in existing().playerOrder
-            && existing().status in ['COUNTDOWN', 'PLAYING']
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'usedWords', 'winnersOrder', 'playersMeta', 'activeTurnUid',
-              'turnEndsAt', 'lastActionNotice', 'status', 'updatedAt'
-            ])
-          )
-          ||
-          // Action 5: Joined player activates Chaos card (THEME_SWAP or TIME_TURBO)
-          (request.auth.uid in existing().playerOrder
-            && existing().status == 'PLAYING'
-            && existing().ruleVariant == 'CHAOS'
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'currentThemeIndex', 'currentTheme', 'usedWords', 'turnEndsAt',
-              'lastActionNotice', 'updatedAt'
-            ])
-          )
-        );
+        && incoming().updatedAt == request.time;
 
-      allow delete: if isSignedIn() && isValidRoomCode(roomId) && existing().hostUid == request.auth.uid;
+      allow delete: if isValidRoomCode(roomId)
+        && existing().createdAtMs < (request.time.toMillis() - 43200000);
 
-      // Private player hands: strictly owner-only
       match /players/{playerId} {
-        allow get: if isSignedIn() && isValidRoomCode(roomId) && isValidId(playerId) && playerId == request.auth.uid;
-        allow list: if false;
+        allow get: if isValidRoomCode(roomId) && isValidId(playerId);
+        allow list: if isValidRoomCode(roomId);
 
-        allow create: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow create: if isValidRoomCode(roomId)
           && isValidId(playerId)
-          && playerId == request.auth.uid
           && isValidPlayer(incoming(), playerId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && exists(/databases/$(database)/documents/rooms/$(roomId));
 
-        allow update: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow update: if isValidRoomCode(roomId)
           && isValidId(playerId)
-          && playerId == request.auth.uid
           && isValidPlayer(incoming(), playerId)
           && incoming().uid == existing().uid
           && incoming().createdAt == existing().createdAt
-          && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'avatar', 'isJunior', 'cards', 'cardCount',
-            'actionCards', 'score', 'roundDealt', 'finishedRound',
-            'lastScoredRound', 'secretThemeCount', 'updatedAt'
-          ]);
+          && incoming().updatedAt == request.time;
 
-        allow delete: if isSignedIn() && isValidRoomCode(roomId) && isValidId(playerId) && playerId == request.auth.uid;
+        allow delete: if isValidRoomCode(roomId) && isValidId(playerId);
       }
 
-      // Secret lobby themes: private to author + host
       match /secretThemes/{themeId} {
-        allow get: if isSignedIn() && isValidRoomCode(roomId) && isValidId(themeId)
-          && (existing().uid == request.auth.uid || existing().hostUid == request.auth.uid);
-        allow list: if isSignedIn()
-          && (resource.data.uid == request.auth.uid || resource.data.hostUid == request.auth.uid);
+        allow get: if isValidRoomCode(roomId) && isValidId(themeId);
+        allow list: if isValidRoomCode(roomId);
 
-        allow create: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow create: if isValidRoomCode(roomId)
           && isValidId(themeId)
           && isValidSecretTheme(incoming())
           && incoming().createdAt == request.time
-          && exists(/databases/$(database)/documents/rooms/$(roomId))
-          && get(/databases/$(database)/documents/rooms/$(roomId)).data.status == 'LOBBY'
-          && get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid == incoming().hostUid
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.playerOrder;
+          && exists(/databases/$(database)/documents/rooms/$(roomId));
 
         allow update: if false;
-        allow delete: if isSignedIn() && isValidRoomCode(roomId) && isValidId(themeId)
-          && (existing().uid == request.auth.uid || existing().hostUid == request.auth.uid);
+        allow delete: if isValidRoomCode(roomId) && isValidId(themeId);
       }
 
-      // Live word ticker feed
       match /feed/{entryId} {
-        allow get: if isSignedIn() && isValidRoomCode(roomId) && isValidId(entryId)
-          && request.auth.uid in existing().visibleTo;
-        allow list: if isSignedIn() && request.auth.uid in resource.data.visibleTo;
+        allow get: if isValidRoomCode(roomId) && isValidId(entryId);
+        allow list: if isValidRoomCode(roomId);
 
-        allow create: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow create: if isValidRoomCode(roomId)
           && isValidId(entryId)
           && isValidFeedEntry(incoming())
           && incoming().createdAt == request.time
-          && incoming().undone == false
-          && exists(/databases/$(database)/documents/rooms/$(roomId))
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.playerOrder;
+          && exists(/databases/$(database)/documents/rooms/$(roomId));
 
-        allow update: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow update: if isValidRoomCode(roomId)
           && isValidId(entryId)
           && isValidFeedEntry(incoming())
-          && existing().uid == request.auth.uid
           && incoming().uid == existing().uid
           && incoming().createdAt == existing().createdAt
           && incoming().diff(existing()).affectedKeys().hasOnly(['undone']);
 
-        allow delete: if false;
+        allow delete: if isValidRoomCode(roomId) && isValidId(entryId);
       }
 
-      // Chaos action events (Karten-Geschenk)
       match /events/{eventId} {
-        allow get: if isSignedIn() && isValidRoomCode(roomId) && isValidId(eventId)
-          && (existing().toUid == request.auth.uid || existing().fromUid == request.auth.uid);
-        allow list: if isSignedIn()
-          && (resource.data.toUid == request.auth.uid || resource.data.fromUid == request.auth.uid);
+        allow get: if isValidRoomCode(roomId) && isValidId(eventId);
+        allow list: if isValidRoomCode(roomId);
 
-        allow create: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow create: if isValidRoomCode(roomId)
           && isValidId(eventId)
           && isValidChaosEvent(incoming())
-          && incoming().fromUid == request.auth.uid
           && incoming().status == 'PENDING'
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && exists(/databases/$(database)/documents/rooms/$(roomId))
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.playerOrder
-          && incoming().toUid in get(/databases/$(database)/documents/rooms/$(roomId)).data.playerOrder;
+          && exists(/databases/$(database)/documents/rooms/$(roomId));
 
-        allow update: if isSignedIn()
-          && isValidRoomCode(roomId)
+        allow update: if isValidRoomCode(roomId)
           && isValidId(eventId)
           && isValidChaosEvent(incoming())
-          && existing().toUid == request.auth.uid
           && existing().status == 'PENDING'
           && incoming().status in ['ACCEPTED', 'BLOCKED']
           && incoming().fromUid == existing().fromUid
@@ -336,7 +264,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
 
-        allow delete: if false;
+        allow delete: if isValidRoomCode(roomId) && isValidId(eventId);
       }
     }
   }

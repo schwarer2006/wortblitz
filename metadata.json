@@ -1,6 +1,6 @@
 {
   "name": "WortBlitz",
-  "description": "Das rasante Echtzeit-Multiplayer-Wortkartenspiel für Familie & Freunde mit KI-Sprachschiedsrichter, QR-Beitritt und Familien-Chaos-Karten.",
+  "description": "Das rasante Echtzeit-Multiplayer-Wortkartenspiel für Familie & Freunde mit KI-Sprachschiedsrichter, Tablet-Tischmodus, KI-Bots und QR-Beitritt.",
   "requestFramePermissions": ["microphone"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

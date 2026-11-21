@@ -1,20 +1,22 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { onAuthStateChanged, type User } from 'firebase/auth';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   collection,
   doc,
-  limit,
   onSnapshot,
-  orderBy,
   query,
   where,
 } from 'firebase/firestore';
 import {
+  AlertTriangle,
   ArrowRight,
+  Eye,
+  EyeOff,
   FolderCog,
+  KeyRound,
   Loader2,
-  LogIn,
+  Lock,
   LogOut,
+  Monitor,
   Plus,
   Users,
   Zap,
@@ -24,28 +26,30 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { GameView } from './components/GameView';
 import { LobbyView } from './components/LobbyView';
 import { RoundEndView } from './components/RoundEndView';
+import { TableDisplayView } from './components/TableDisplayView';
 import { VictoryView } from './components/VictoryView';
+import { AVATARS, MIXED_FAMILY_CATEGORY } from './data/themesAndCards';
+import { useBotRunner } from './hooks/useBotRunner';
 import {
-  AVATARS,
-  MIXED_FAMILY_CATEGORY,
-} from './data/themesAndCards';
-import {
-  auth,
-  db,
+  getDb,
+  getOrCreatePlayerId,
   handleFirestoreError,
+  initFirebaseFromConfig,
   OperationType,
-  signInWithGoogle,
-  signOutUser,
-  testFirestoreConnection,
 } from './lib/firebase';
+import { authenticateFamilyPin } from './lib/geminiProxy';
 import {
+  addBotToLobby,
   advanceTheme,
   advanceTurnInTurnBasedMode,
   claimMyRoundPoints,
   consumeActionCard,
   createRoom,
-  dealMyHandForRound,
+  dealAllBotsForRound,
+  dealHandForParticipant,
+  finalizeRoundEndAfterDelay,
   hostCheckGameOverOrNextRound,
+  hostClaimBotRoundPoints,
   hostFinishRoundManually,
   hostResetRoomToLobby,
   joinRoom,
@@ -53,15 +57,24 @@ import {
   playChaosTimeTurbo,
   recordAcceptedWord,
   recordRejectedWord,
+  removeBotFromLobby,
   resolveChaosGiftEvent,
+  ROUND_END_DELAY_MS,
   sendChaosGift,
   startMatch,
   submitSecretLobbyTheme,
   transitionCountdownToPlaying,
   undoWordEntry,
+  updateBotDifficultyInLobby,
   updateHostLobbySettings,
   updatePlayerProfileInLobby,
 } from './lib/roomService';
+import {
+  playSuccessChime,
+  speakModerator,
+  stopModeratorSpeech,
+  unlockAndTestAudio,
+} from './lib/soundAndSpeech';
 import type {
   ChaosEvent,
   CustomDeck,
@@ -76,8 +89,10 @@ import type {
 const PROFILE_STORAGE_KEY = 'wortblitz_profile_v1';
 const CUSTOM_DECKS_STORAGE_KEY = 'wortblitz_custom_decks_v1';
 const ACTIVE_ROOM_STORAGE_KEY = 'wortblitz_active_room_v1';
+const FAMILY_PIN_STORAGE_KEY = 'wortblitz_family_pin_v1';
+const TABLE_AUDIO_STORAGE_KEY = 'wortblitz_table_audio_device_v1';
 
-function loadStoredProfile(user: User | null): LocalPlayerProfile {
+function loadStoredProfile(): LocalPlayerProfile {
   try {
     const raw = localStorage.getItem(PROFILE_STORAGE_KEY);
     if (raw) {
@@ -91,10 +106,9 @@ function loadStoredProfile(user: User | null): LocalPlayerProfile {
       }
     }
   } catch {
-    // ignore storage parse failure
+    // ignore
   }
-  const firstName = user?.displayName?.split(' ')[0]?.slice(0, 24) || 'Spieler';
-  return { name: firstName, avatar: 'fox', isJunior: false };
+  return { name: '', avatar: 'fox', isJunior: false };
 }
 
 function loadStoredDecks(): CustomDeck[] {
@@ -111,12 +125,24 @@ function loadStoredDecks(): CustomDeck[] {
 }
 
 function WortBlitzApp() {
-  const [authReady, setAuthReady] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [myUid] = useState<string>(() => getOrCreatePlayerId());
 
-  const [profile, setProfile] = useState<LocalPlayerProfile>(() => loadStoredProfile(null));
+  // Firebase external config state
+  const [firebaseStatus, setFirebaseStatus] = useState<
+    | { state: 'LOADING' }
+    | { state: 'READY' }
+    | { state: 'CONFIG_ERROR'; reason: string; message: string }
+  >({ state: 'LOADING' });
+
+  // Family PIN auth state
+  const [authChecking, setAuthChecking] = useState(true);
+  const [familyPin, setFamilyPin] = useState<string | null>(null);
+  const [pinInput, setPinInput] = useState('');
+  const [showPin, setShowPin] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [pinSubmitting, setPinSubmitting] = useState(false);
+
+  const [profile, setProfile] = useState<LocalPlayerProfile>(() => loadStoredProfile());
   const [customDecks, setCustomDecks] = useState<CustomDeck[]>(() => loadStoredDecks());
 
   // Home screen setup state
@@ -130,6 +156,7 @@ function WortBlitzApp() {
   const [setupRuleVariant, setSetupRuleVariant] = useState<RuleVariant>('CHAOS');
   const [setupPenaltyEnabled, setSetupPenaltyEnabled] = useState(true);
   const [setupDuration, setSetupDuration] = useState<15 | 20 | 30>(20);
+  const [setupTableMode, setSetupTableMode] = useState(false);
   const [setupCategory, setSetupCategory] = useState(MIXED_FAMILY_CATEGORY.name);
   const [setupThemes, setSetupThemes] = useState<string[]>(MIXED_FAMILY_CATEGORY.themes);
   const [deckModalOpen, setDeckModalOpen] = useState(false);
@@ -138,13 +165,8 @@ function WortBlitzApp() {
   const [activeRoomCode, setActiveRoomCode] = useState<string | null>(() => {
     const params = new URLSearchParams(window.location.search);
     const urlRoom = params.get('room');
-    if (urlRoom && /^[0-9]{4}$/.test(urlRoom)) return null; // Auto-join after profile/auth check
+    if (urlRoom && /^[0-9]{4}$/.test(urlRoom)) return null;
     return sessionStorage.getItem(ACTIVE_ROOM_STORAGE_KEY);
-  });
-  const [pendingQrRoom, setPendingQrRoom] = useState<string | null>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlRoom = params.get('room');
-    return urlRoom && /^[0-9]{4}$/.test(urlRoom) ? urlRoom : null;
   });
 
   const [room, setRoom] = useState<RoomData | null>(null);
@@ -152,15 +174,87 @@ function WortBlitzApp() {
   const [feedEntries, setFeedEntries] = useState<FeedEntry[]>([]);
   const [pendingGifts, setPendingGifts] = useState<ChaosEvent[]>([]);
   const [muted, setMuted] = useState(false);
+  const [isTableAudioDevice, setIsTableAudioDevice] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(TABLE_AUDIO_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [heroImgError, setHeroImgError] = useState(false);
 
-  // If QR code URL param exists, pre-fill join tab
+  const dealtHandRoundRef = useRef<string>('');
+  const dealtBotsRoundRef = useRef<string>('');
+  const initialAnnouncementSyncedRoomRef = useRef<string | null>(null);
+  const lastSpokenAnnouncementIdRef = useRef<string | null>(null);
+  const isTableAudioRef = useRef<boolean>(isTableAudioDevice);
+  isTableAudioRef.current = isTableAudioDevice;
+
+  // 1. Load external ./firebase-config.json on boot
   useEffect(() => {
-    if (pendingQrRoom) {
-      setHomeMode('JOIN');
-      setJoinCode(pendingQrRoom);
-    }
-  }, [pendingQrRoom]);
+    let active = true;
+    initFirebaseFromConfig().then((result) => {
+      if (!active) return;
+      if (result.ok) {
+        setFirebaseStatus({ state: 'READY' });
+      } else {
+        setFirebaseStatus({
+          state: 'CONFIG_ERROR',
+          reason: result.reason,
+          message: result.message,
+        });
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // 2. Check URL ?room=...&pin=... and localStorage PIN on boot
+  useEffect(() => {
+    let active = true;
+
+    const bootstrapAuth = async () => {
+      const params = new URLSearchParams(window.location.search);
+      const urlRoom = params.get('room');
+      const urlPin = params.get('pin');
+
+      if (urlRoom && /^[0-9]{4}$/.test(urlRoom)) {
+        setHomeMode('JOIN');
+        setJoinCode(urlRoom);
+      }
+
+      const candidatePin =
+        urlPin?.trim() || localStorage.getItem(FAMILY_PIN_STORAGE_KEY)?.trim() || '';
+
+      if (candidatePin) {
+        const res = await authenticateFamilyPin(candidatePin);
+        if (!active) return;
+        if (res.ok) {
+          localStorage.setItem(FAMILY_PIN_STORAGE_KEY, candidatePin);
+          setFamilyPin(candidatePin);
+          if (urlPin) {
+            // Strip pin from URL bar after automatic login
+            const cleanUrl = urlRoom ? `?room=${urlRoom}` : window.location.pathname;
+            window.history.replaceState({}, '', cleanUrl);
+          }
+        } else {
+          localStorage.removeItem(FAMILY_PIN_STORAGE_KEY);
+          setFamilyPin(null);
+          if (urlPin) {
+            setPinError('Der Link-Zugangscode ist ungültig oder abgelaufen.');
+          }
+        }
+      }
+
+      if (active) setAuthChecking(false);
+    };
+
+    bootstrapAuth();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Persist profile and custom decks
   useEffect(() => {
@@ -179,27 +273,9 @@ function WortBlitzApp() {
     }
   }, [customDecks]);
 
-  // Firebase Auth listener + initial connection check
+  // 3. Firestore real-time subscriptions when inside a room
   useEffect(() => {
-    testFirestoreConnection();
-    const unsub = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      if (u) {
-        setProfile((prev) => {
-          if (prev.name === 'Spieler' && u.displayName) {
-            return { ...prev, name: u.displayName.split(' ')[0].slice(0, 24) };
-          }
-          return prev;
-        });
-      }
-      setAuthReady(true);
-    });
-    return () => unsub();
-  }, []);
-
-  // Firestore real-time subscriptions when inside a room
-  useEffect(() => {
-    if (!authReady || !user || !activeRoomCode) {
+    if (firebaseStatus.state !== 'READY' || !familyPin || !activeRoomCode) {
       setRoom(null);
       setMyPlayer(null);
       setFeedEntries([]);
@@ -207,6 +283,7 @@ function WortBlitzApp() {
       return;
     }
 
+    const db = getDb();
     const roomPath = `rooms/${activeRoomCode}`;
     const unsubRoom = onSnapshot(
       doc(db, 'rooms', activeRoomCode),
@@ -222,9 +299,9 @@ function WortBlitzApp() {
       (err) => handleFirestoreError(err, OperationType.GET, roomPath)
     );
 
-    const playerPath = `rooms/${activeRoomCode}/players/${user.uid}`;
+    const playerPath = `rooms/${activeRoomCode}/players/${myUid}`;
     const unsubPlayer = onSnapshot(
-      doc(db, 'rooms', activeRoomCode, 'players', user.uid),
+      doc(db, 'rooms', activeRoomCode, 'players', myUid),
       (snap) => {
         setMyPlayer(snap.exists() ? (snap.data() as PlayerData) : null);
       },
@@ -232,10 +309,7 @@ function WortBlitzApp() {
     );
 
     const feedPath = `rooms/${activeRoomCode}/feed`;
-    const feedQuery = query(
-      collection(db, 'rooms', activeRoomCode, 'feed'),
-      where('visibleTo', 'array-contains', user.uid)
-    );
+    const feedQuery = query(collection(db, 'rooms', activeRoomCode, 'feed'));
     const unsubFeed = onSnapshot(
       feedQuery,
       (snap) => {
@@ -246,7 +320,7 @@ function WortBlitzApp() {
             const secB = (b.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
             return secB - secA;
           })
-          .slice(0, 20);
+          .slice(0, 100);
         setFeedEntries(entries);
       },
       (err) => handleFirestoreError(err, OperationType.LIST, feedPath)
@@ -255,7 +329,7 @@ function WortBlitzApp() {
     const eventsPath = `rooms/${activeRoomCode}/events`;
     const eventsQuery = query(
       collection(db, 'rooms', activeRoomCode, 'events'),
-      where('toUid', '==', user.uid)
+      where('toUid', '==', myUid)
     );
     const unsubEvents = onSnapshot(
       eventsQuery,
@@ -275,33 +349,132 @@ function WortBlitzApp() {
       unsubFeed();
       unsubEvents();
     };
-  }, [authReady, user, activeRoomCode]);
+  }, [firebaseStatus.state, familyPin, activeRoomCode, myUid]);
 
-  // Automatically deal this player's private hand when a new round starts
+  // 3b. Firestore-driven table audio moderation (only speaks when isTableAudioDevice === true)
   useEffect(() => {
-    if (!room || !myPlayer || !user) return;
+    if (!room) {
+      initialAnnouncementSyncedRoomRef.current = null;
+      lastSpokenAnnouncementIdRef.current = null;
+      return;
+    }
+
+    const incomingId = room.latestAnnouncement?.id ?? null;
+
+    // On initial room load / page reload, record existing ID without replaying old announcements
+    if (initialAnnouncementSyncedRoomRef.current !== room.code) {
+      initialAnnouncementSyncedRoomRef.current = room.code;
+      lastSpokenAnnouncementIdRef.current = incomingId;
+      return;
+    }
+
+    if (incomingId && incomingId !== lastSpokenAnnouncementIdRef.current) {
+      lastSpokenAnnouncementIdRef.current = incomingId;
+      if (isTableAudioRef.current && room.latestAnnouncement?.text) {
+        speakModerator(room.latestAnnouncement.text);
+      }
+    }
+  }, [room?.code, room?.latestAnnouncement?.id, room?.latestAnnouncement?.text]);
+
+  // 4. Deal player hand and bot hands when a round starts (guarded against rapid duplicate snapshots)
+  useEffect(() => {
+    if (!room) {
+      dealtHandRoundRef.current = '';
+      dealtBotsRoundRef.current = '';
+      return;
+    }
+    if (room.status !== 'COUNTDOWN' && room.status !== 'PLAYING') return;
+    if (room.roundNumber <= 0) return;
+
+    const handKey = `${room.code}-${room.roundNumber}-${myUid}`;
     if (
-      (room.status === 'COUNTDOWN' || room.status === 'PLAYING') &&
-      room.roundNumber > 0 &&
-      myPlayer.roundDealt < room.roundNumber
+      myPlayer &&
+      myPlayer.roundDealt < room.roundNumber &&
+      dealtHandRoundRef.current !== handKey
     ) {
-      dealMyHandForRound(
+      dealtHandRoundRef.current = handKey;
+      dealHandForParticipant(
         room.code,
-        user.uid,
+        myUid,
         room.roundNumber,
         myPlayer.isJunior,
         room.ruleVariant
       );
     }
-  }, [room, myPlayer, user]);
 
-  // Host monitors scores during ROUND_END to detect 10-point victory
+    const botsKey = `${room.code}-${room.roundNumber}-bots`;
+    if (room.hostUid === myUid && dealtBotsRoundRef.current !== botsKey) {
+      dealtBotsRoundRef.current = botsKey;
+      dealAllBotsForRound(room);
+    }
+  }, [room, myPlayer, myUid]);
+
+  // 5. Host safety net: finalize ROUND_END 1.2s after penultimate/final player discards last card
   useEffect(() => {
-    if (!room || !user) return;
-    if (room.status === 'ROUND_END' && room.hostUid === user.uid) {
+    if (!room || room.hostUid !== myUid || room.status !== 'PLAYING') return;
+    if (room.playerOrder.length < 2) return;
+
+    const remainingPlayers = room.playerOrder.filter(
+      (uid) => !room.winnersOrder.includes(uid)
+    );
+    if (remainingPlayers.length > 1) return;
+
+    const roundToFinish = room.roundNumber;
+    const roomCode = room.code;
+    const timerId = window.setTimeout(() => {
+      finalizeRoundEndAfterDelay(roomCode, roundToFinish);
+    }, ROUND_END_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [
+    room?.code,
+    room?.hostUid,
+    room?.status,
+    room?.roundNumber,
+    room?.playerOrder,
+    room?.winnersOrder,
+    myUid,
+  ]);
+
+  // 6. Host checks victory target score during ROUND_END
+  useEffect(() => {
+    if (!room) return;
+    if (room.status === 'ROUND_END' && room.hostUid === myUid) {
       hostCheckGameOverOrNextRound(room, 'FINISH_CHECK');
     }
-  }, [room, user]);
+  }, [room, myUid]);
+
+  // 6. Host runs KI-Bots during active round
+  const isHost = Boolean(room && room.hostUid === myUid);
+  useBotRunner({
+    room,
+    isHost,
+    familyPin: familyPin ?? '',
+    onBotPlayedWord: () => {
+      if (isTableAudioDevice && !muted) {
+        playSuccessChime(false);
+      }
+    },
+  });
+
+  const handleToggleTableAudio = useCallback(() => {
+    const next = !isTableAudioDevice;
+    try {
+      localStorage.setItem(TABLE_AUDIO_STORAGE_KEY, String(next));
+    } catch {
+      // ignore storage failure
+    }
+    isTableAudioRef.current = next;
+    setIsTableAudioDevice(next);
+    if (next) {
+      lastSpokenAnnouncementIdRef.current = room?.latestAnnouncement?.id ?? null;
+      unlockAndTestAudio();
+    } else {
+      stopModeratorSpeech();
+    }
+  }, [isTableAudioDevice, room?.latestAnnouncement?.id]);
 
   const handleSaveCustomDeck = useCallback((deck: CustomDeck) => {
     setCustomDecks((prev) => {
@@ -319,27 +492,42 @@ function WortBlitzApp() {
     setCustomDecks((prev) => prev.filter((d) => d.id !== id));
   }, []);
 
-  const handleGoogleLogin = async () => {
-    setAuthLoading(true);
-    setAuthError(null);
-    try {
-      await signInWithGoogle();
-    } catch (err) {
-      setAuthError(
-        err instanceof Error ? err.message : 'Anmeldung fehlgeschlagen. Bitte erneut versuchen.'
-      );
-    } finally {
-      setAuthLoading(false);
+  const handlePinSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (pinSubmitting) return;
+    setPinSubmitting(true);
+    setPinError(null);
+    const res = await authenticateFamilyPin(pinInput);
+    if (res.ok) {
+      const cleanPin = pinInput.trim();
+      localStorage.setItem(FAMILY_PIN_STORAGE_KEY, cleanPin);
+      setFamilyPin(cleanPin);
+      setPinInput('');
+    } else {
+      setPinError(res.error);
     }
+    setPinSubmitting(false);
+  };
+
+  const handleLogout = () => {
+    stopModeratorSpeech();
+    initialAnnouncementSyncedRoomRef.current = null;
+    lastSpokenAnnouncementIdRef.current = null;
+    localStorage.removeItem(FAMILY_PIN_STORAGE_KEY);
+    sessionStorage.removeItem(ACTIVE_ROOM_STORAGE_KEY);
+    setFamilyPin(null);
+    setActiveRoomCode(null);
+    setRoom(null);
+    setMyPlayer(null);
   };
 
   const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || busyAction) return;
+    if (busyAction || firebaseStatus.state !== 'READY') return;
     setBusyAction(true);
     setJoinError(null);
     try {
-      const code = await createRoom(user.uid, profile, {
+      const code = await createRoom(myUid, profile, {
         maxPlayers: setupMaxPlayers,
         turnMode: setupTurnMode,
         ruleVariant: setupRuleVariant,
@@ -347,11 +535,14 @@ function WortBlitzApp() {
         roundDurationSec: setupDuration,
         selectedCategory: setupCategory,
         deckThemes: setupThemes,
+        tableDisplayActive: setupTableMode,
       });
       sessionStorage.setItem(ACTIVE_ROOM_STORAGE_KEY, code);
       setActiveRoomCode(code);
     } catch (err) {
-      setJoinError(err instanceof Error ? err.message : 'Raum konnte nicht erstellt werden.');
+      setJoinError(
+        err instanceof Error ? err.message : 'Raum konnte nicht erstellt werden.'
+      );
     } finally {
       setBusyAction(false);
     }
@@ -359,18 +550,17 @@ function WortBlitzApp() {
 
   const handleJoinRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || busyAction) return;
+    if (busyAction || firebaseStatus.state !== 'READY') return;
     setBusyAction(true);
     setJoinError(null);
     try {
-      const result = await joinRoom(joinCode, user.uid, profile);
+      const result = await joinRoom(joinCode, myUid, profile);
       if (!result.ok) {
         setJoinError(result.error);
       } else {
         sessionStorage.setItem(ACTIVE_ROOM_STORAGE_KEY, result.code);
         setActiveRoomCode(result.code);
-        setPendingQrRoom(null);
-        window.history.replaceState({}, '', '/');
+        window.history.replaceState({}, '', window.location.pathname);
       }
     } catch (err) {
       setJoinError(err instanceof Error ? err.message : 'Beitritt fehlgeschlagen.');
@@ -380,107 +570,245 @@ function WortBlitzApp() {
   };
 
   const handleLeaveRoom = () => {
+    stopModeratorSpeech();
+    initialAnnouncementSyncedRoomRef.current = null;
+    lastSpokenAnnouncementIdRef.current = null;
     sessionStorage.removeItem(ACTIVE_ROOM_STORAGE_KEY);
     setActiveRoomCode(null);
     setRoom(null);
     setMyPlayer(null);
   };
 
-  if (!authReady) {
+  // Loading state
+  if (firebaseStatus.state === 'LOADING' || authChecking) {
     return (
-      <div className="min-h-screen bg-[#0F1117] flex items-center justify-center">
-        <Loader2 className="w-8 h-8 text-amber-400 animate-spin" />
+      <div className="min-h-screen bg-[#0F1117] flex items-center justify-center text-slate-300">
+        <Loader2 className="w-8 h-8 text-amber-400 animate-spin mr-3" />
+        <span>WortBlitz wird geladen…</span>
+      </div>
+    );
+  }
+
+  // Firebase Config Placeholder / Missing Screen
+  if (firebaseStatus.state === 'CONFIG_ERROR') {
+    return (
+      <div className="min-h-screen bg-[#0F1117] text-slate-100 flex items-center justify-center p-5">
+        <div className="max-w-lg w-full rounded-3xl bg-[#1C202E] border border-amber-400/40 p-6 sm:p-8 space-y-4">
+          <div className="flex items-center gap-3 text-amber-400">
+            <AlertTriangle className="w-7 h-7 shrink-0" />
+            <h1 className="text-xl font-display font-bold text-white">
+              Firebase-Konfiguration erforderlich
+            </h1>
+          </div>
+          <p className="text-sm text-slate-300 leading-relaxed">
+            {firebaseStatus.message}
+          </p>
+          <div className="p-4 rounded-2xl bg-[#0F1117] border border-white/10 text-xs text-slate-300 space-y-2">
+            <p className="font-semibold text-white">So richtest du Firebase ein:</p>
+            <ol className="list-decimal list-inside space-y-1 text-slate-400">
+              <li>
+                Öffne die Datei <code className="text-amber-300">firebase-config.json</code> auf deinem Webserver (bzw. <code className="text-amber-300">public/firebase-config.json</code> vor dem Build).
+              </li>
+              <li>
+                Ersetze alle Platzhalter (<code className="text-amber-300">DEIN_FIREBASE_API_KEY</code>, <code className="text-amber-300">DEIN_PROJEKT_ID</code> usw.) mit den Werten deiner Firebase-Web-App.
+              </li>
+              <li>Lade diese Seite anschließend neu.</li>
+            </ol>
+          </div>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="w-full min-h-[48px] rounded-2xl bg-amber-400 text-slate-950 font-display font-bold hover:bg-amber-300 transition-colors"
+          >
+            Erneut prüfen
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Family Password Login Gate
+  if (!familyPin) {
+    return (
+      <div className="min-h-screen bg-[#0F1117] text-slate-100 flex items-center justify-center p-5">
+        <div className="max-w-md w-full rounded-3xl bg-[#1C202E] border border-white/10 p-6 sm:p-8 space-y-6 shadow-2xl">
+          <div className="text-center space-y-2">
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-amber-400/15 border border-amber-400/30 text-amber-400 mb-1">
+              <Lock className="w-7 h-7" />
+            </div>
+            <h1 className="text-2xl sm:text-3xl font-display font-extrabold text-white">
+              WortBlitz – Familien-Zugang
+            </h1>
+            <p className="text-sm text-slate-400">
+              Bitte gib euer gemeinsames Familien-Passwort ein, um den Spielbereich und KI-Schiedsrichter freizuschalten.
+            </p>
+          </div>
+
+          <form onSubmit={handlePinSubmit} className="space-y-4">
+            <div className="relative">
+              <KeyRound className="w-5 h-5 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type={showPin ? 'text' : 'password'}
+                value={pinInput}
+                onChange={(e) => setPinInput(e.target.value)}
+                placeholder="Familien-Passwort"
+                autoFocus
+                className="w-full min-h-[52px] pl-12 pr-12 rounded-2xl bg-[#0F1117] border border-white/15 text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPin((s) => !s)}
+                aria-label={showPin ? 'Passwort verbergen' : 'Passwort anzeigen'}
+                className="absolute right-2 top-1/2 -translate-y-1/2 min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-400 hover:text-white"
+              >
+                {showPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+
+            {pinError && <p className="text-xs text-rose-400">{pinError}</p>}
+
+            <button
+              type="submit"
+              disabled={pinSubmitting || !pinInput.trim()}
+              className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+            >
+              {pinSubmitting ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <ArrowRight className="w-5 h-5" />
+              )}
+              <span>Freischalten</span>
+            </button>
+          </form>
+        </div>
       </div>
     );
   }
 
   // Active Room Routing
-  if (user && activeRoomCode && room) {
+  if (activeRoomCode && room) {
     if (room.status === 'LOBBY') {
       return (
         <LobbyView
           room={room}
-          myUid={user.uid}
+          myUid={myUid}
+          familyPin={familyPin}
           myPlayer={myPlayer}
           profile={profile}
           customDecks={customDecks}
+          isTableAudioDevice={isTableAudioDevice}
+          onToggleTableAudio={handleToggleTableAudio}
           onSaveCustomDeck={handleSaveCustomDeck}
           onDeleteCustomDeck={handleDeleteCustomDeck}
           onUpdateHostSettings={(s) => updateHostLobbySettings(room.code, s)}
+          onAddBot={(difficulty) => addBotToLobby(room, difficulty)}
+          onRemoveBot={(botUid) => removeBotFromLobby(room, botUid)}
+          onUpdateBotDifficulty={(botUid, diff) =>
+            updateBotDifficultyInLobby(room.code, botUid, diff)
+          }
           onUpdateProfileInLobby={async (next) => {
             setProfile(next);
-            await updatePlayerProfileInLobby(room.code, user.uid, next);
+            await updatePlayerProfileInLobby(room.code, myUid, next);
           }}
           onSubmitSecretTheme={(themeText) =>
             submitSecretLobbyTheme(
               room.code,
               room.hostUid,
-              user.uid,
+              myUid,
               themeText,
               myPlayer?.secretThemeCount ?? 0
             )
           }
-          onStartMatch={() => startMatch(room, user.uid)}
+          onStartMatch={() => startMatch(room, myUid)}
           onLeaveRoom={handleLeaveRoom}
+          onLogout={handleLogout}
         />
       );
     }
 
-    if ((room.status === 'COUNTDOWN' || room.status === 'PLAYING') && myPlayer) {
-      return (
-        <GameView
-          room={room}
-          myUid={user.uid}
-          myPlayer={myPlayer}
-          feedEntries={feedEntries}
-          pendingGifts={pendingGifts}
-          muted={muted}
-          onToggleMute={() => setMuted((m) => !m)}
-          onCountdownFinished={() => transitionCountdownToPlaying(room)}
-          onThemeTimedOut={() => advanceTheme(room, 'Zeit um — nächstes Thema!')}
-          onTurnTimedOut={() =>
-            advanceTurnInTurnBasedMode(room, 'Zugzeit abgelaufen — nächster Spieler!')
-          }
-          onAcceptWord={(params) =>
-            recordAcceptedWord({ room, player: myPlayer, ...params })
-          }
-          onRejectWord={(params) =>
-            recordRejectedWord({ room, player: myPlayer, ...params })
-          }
-          onUndoEntry={(entry, normalizedWord) =>
-            undoWordEntry({ room, player: myPlayer, entry, normalizedWord })
-          }
-          onConsumeShieldForPenalty={async () => {
-            await consumeActionCard(room.code, myPlayer, 'SHIELD');
-          }}
-          onPlayThemeSwap={() => playChaosThemeSwap(room, myPlayer)}
-          onPlayTimeTurbo={() => playChaosTimeTurbo(room, myPlayer)}
-          onSendGift={(targetUid, targetName, cardIndex) =>
-            sendChaosGift({ room, sender: myPlayer, targetUid, targetName, cardIndex })
-          }
-          onResolveGift={(event, useShield) =>
-            resolveChaosGiftEvent({
-              room,
-              player: myPlayer,
-              eventId: event.id,
-              letter: event.letter,
-              useShield,
-            })
-          }
-          onFinishRoundManually={() => hostFinishRoundManually(room)}
-        />
-      );
+    if (room.status === 'COUNTDOWN' || room.status === 'PLAYING') {
+      if (isHost && room.tableDisplayActive) {
+        return (
+          <TableDisplayView
+            room={room}
+            familyPin={familyPin}
+            feedEntries={feedEntries}
+            muted={muted}
+            isTableAudioDevice={isTableAudioDevice}
+            onToggleTableAudio={handleToggleTableAudio}
+            onToggleMute={() => setMuted((m) => !m)}
+            onCountdownFinished={() => transitionCountdownToPlaying(room)}
+            onThemeTimedOut={() => advanceTheme(room, 'Zeit um – nächstes Thema!')}
+            onTurnTimedOut={() =>
+              advanceTurnInTurnBasedMode(room, 'Zugzeit abgelaufen – nächster Spieler!')
+            }
+            onFinishRoundManually={() => hostFinishRoundManually(room)}
+            onLeaveRoom={handleLeaveRoom}
+          />
+        );
+      }
+
+      if (myPlayer) {
+        return (
+          <GameView
+            room={room}
+            myUid={myUid}
+            familyPin={familyPin}
+            myPlayer={myPlayer}
+            feedEntries={feedEntries}
+            pendingGifts={pendingGifts}
+            muted={muted}
+            isTableAudioDevice={isTableAudioDevice}
+            onToggleTableAudio={handleToggleTableAudio}
+            onToggleMute={() => setMuted((m) => !m)}
+            onCountdownFinished={() => transitionCountdownToPlaying(room)}
+            onThemeTimedOut={() => advanceTheme(room, 'Zeit um – nächstes Thema!')}
+            onTurnTimedOut={() =>
+              advanceTurnInTurnBasedMode(room, 'Zugzeit abgelaufen – nächster Spieler!')
+            }
+            onAcceptWord={(params) =>
+              recordAcceptedWord({ room, player: myPlayer, ...params })
+            }
+            onRejectWord={(params) =>
+              recordRejectedWord({ room, player: myPlayer, ...params })
+            }
+            onUndoEntry={(entry, normalizedWord) =>
+              undoWordEntry({ room, player: myPlayer, entry, normalizedWord })
+            }
+            onConsumeShieldForPenalty={async () => {
+              await consumeActionCard(room.code, myPlayer, 'SHIELD');
+            }}
+            onPlayThemeSwap={() => playChaosThemeSwap(room, myPlayer)}
+            onPlayTimeTurbo={() => playChaosTimeTurbo(room, myPlayer)}
+            onSendGift={(targetUid, targetName, cardIndex) =>
+              sendChaosGift({ room, sender: myPlayer, targetUid, targetName, cardIndex })
+            }
+            onResolveGift={(event, useShield) =>
+              resolveChaosGiftEvent({
+                room,
+                player: myPlayer,
+                eventId: event.id,
+                letter: event.letter,
+                useShield,
+              })
+            }
+            onFinishRoundManually={() => hostFinishRoundManually(room)}
+            onLogout={handleLogout}
+          />
+        );
+      }
     }
 
-    if (room.status === 'ROUND_END' && myPlayer) {
+    if (room.status === 'ROUND_END' && (myPlayer || (isHost && room.tableDisplayActive))) {
       return (
         <RoundEndView
           room={room}
-          myUid={user.uid}
+          myUid={myUid}
           myPlayer={myPlayer}
           onClaimMyPoints={async () => {
-            await claimMyRoundPoints(room, myPlayer);
+            if (myPlayer) await claimMyRoundPoints(room, myPlayer);
           }}
+          onHostClaimBotPoints={() => hostClaimBotRoundPoints(room)}
           onNextRoundOrFinish={() => hostCheckGameOverOrNextRound(room, 'NEXT_ROUND')}
         />
       );
@@ -490,7 +818,7 @@ function WortBlitzApp() {
       return (
         <VictoryView
           room={room}
-          myUid={user.uid}
+          myUid={myUid}
           muted={muted}
           onResetToLobby={() => hostResetRoomToLobby(room)}
           onLeaveRoom={handleLeaveRoom}
@@ -506,10 +834,9 @@ function WortBlitzApp() {
     );
   }
 
-  // Home / Sign-In & Room Setup Screen
+  // Home / Room Creation & Join Screen
   return (
     <div className="min-h-screen bg-[#0F1117] text-slate-100">
-      {/* Top Bar */}
       <header className="border-b border-white/10 bg-[#0F1117]/90 backdrop-blur-md sticky top-0 z-30">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-6">
           <div className="flex items-center gap-2.5 whitespace-nowrap shrink-0">
@@ -519,31 +846,14 @@ function WortBlitzApp() {
             </span>
           </div>
 
-          {user ? (
-            <div className="flex items-center gap-3 shrink-0">
-              <span className="text-xs text-slate-300 hidden sm:inline truncate max-w-[180px]">
-                {user.displayName || user.email}
-              </span>
-              <button
-                type="button"
-                onClick={() => signOutUser()}
-                className="min-h-[40px] px-3.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 flex items-center gap-1.5 whitespace-nowrap transition-colors"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                <span>Abmelden</span>
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              disabled={authLoading}
-              onClick={handleGoogleLogin}
-              className="min-h-[40px] px-4 rounded-xl bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
-            >
-              <LogIn className="w-4 h-4" />
-              <span>Anmelden</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="min-h-[40px] px-3.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Abmelden</span>
+          </button>
         </div>
       </header>
 
@@ -558,18 +868,18 @@ function WortBlitzApp() {
               Jeder sieht seine eigenen Buchstaben auf dem Smartphone, ruft passende Begriffe ins Mikrofon und der KI-Schiedsrichter prüft blitzschnell in Echtzeit.
             </p>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
-              <span>2–8 Spieler per QR-Code</span>
+              <span>2–8 Spieler &amp; KI-Bots</span>
+              <span aria-hidden="true">·</span>
+              <span>Tablet-Tischmodus</span>
               <span aria-hidden="true">·</span>
               <span>Junior-Fairness</span>
-              <span aria-hidden="true">·</span>
-              <span>Familien-Chaos-Karten</span>
             </div>
           </div>
 
           <div className="rounded-3xl overflow-hidden border border-white/10 bg-[#1C202E] aspect-[4/3] sm:aspect-[16/10] relative">
             {!heroImgError ? (
               <img
-                src="/src/assets/images/wortblitz_cards_hero_1795193543971.jpg"
+                src="./src/assets/images/wortblitz_cards_hero_1795193543971.jpg"
                 alt="WortBlitz Buchstabenkarten auf dunklem Spieltisch"
                 referrerPolicy="no-referrer"
                 onError={() => setHeroImgError(true)}
@@ -603,64 +913,37 @@ function WortBlitzApp() {
         {/* Right Interactive Entry Card */}
         <section className="lg:col-span-6">
           <div className="h-full rounded-3xl bg-[#1C202E] border border-white/10 p-5 sm:p-7 flex flex-col justify-between gap-6">
-            {!user ? (
-              <div className="my-auto space-y-5 text-center py-6">
-                <h2 className="text-2xl font-display font-bold text-white">
-                  {pendingQrRoom
-                    ? `Raum ${pendingQrRoom} beitreten`
-                    : 'Mit deinem Konto loslegen'}
-                </h2>
-                <p className="text-sm text-slate-300 max-w-sm mx-auto">
-                  Melde dich kurz mit Google an, damit deine Kartenhand und Punkte in Echtzeit mit allen Smartphones synchronisiert werden.
-                </p>
-                {authError && (
-                  <p className="text-xs text-rose-400">{authError}</p>
-                )}
+            <div className="space-y-5">
+              {/* Mode Toggle */}
+              <div className="grid grid-cols-2 gap-1 p-1 bg-[#0F1117] rounded-2xl border border-white/10">
                 <button
                   type="button"
-                  disabled={authLoading}
-                  onClick={handleGoogleLogin}
-                  className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 flex items-center justify-center gap-2 transition-colors"
+                  onClick={() => setHomeMode('CREATE')}
+                  className={`min-h-[44px] rounded-xl text-sm font-semibold transition-colors ${
+                    homeMode === 'CREATE'
+                      ? 'bg-amber-400 text-slate-950'
+                      : 'text-slate-300 hover:text-white'
+                  }`}
                 >
-                  {authLoading ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <LogIn className="w-5 h-5" />
-                  )}
-                  <span>Mit Google anmelden &amp; spielen</span>
+                  Neuen Raum erstellen
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHomeMode('JOIN')}
+                  className={`min-h-[44px] rounded-xl text-sm font-semibold transition-colors ${
+                    homeMode === 'JOIN'
+                      ? 'bg-amber-400 text-slate-950'
+                      : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  Raum beitreten
                 </button>
               </div>
-            ) : (
-              <div className="space-y-5">
-                {/* Mode Toggle: Create vs Join */}
-                <div className="grid grid-cols-2 gap-1 p-1 bg-[#0F1117] rounded-2xl border border-white/10">
-                  <button
-                    type="button"
-                    onClick={() => setHomeMode('CREATE')}
-                    className={`min-h-[44px] rounded-xl text-sm font-semibold transition-colors ${
-                      homeMode === 'CREATE'
-                        ? 'bg-amber-400 text-slate-950'
-                        : 'text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    Neuen Raum erstellen
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setHomeMode('JOIN')}
-                    className={`min-h-[44px] rounded-xl text-sm font-semibold transition-colors ${
-                      homeMode === 'JOIN'
-                        ? 'bg-amber-400 text-slate-950'
-                        : 'text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    Raum beitreten
-                  </button>
-                </div>
 
-                {/* Player Profile Setup */}
+              {/* Player Profile (hidden when host chooses Table Display Mode) */}
+              {!(homeMode === 'CREATE' && setupTableMode) && (
                 <div className="space-y-3 p-4 rounded-2xl bg-[#161923] border border-white/10">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-semibold text-slate-300">
                       Dein Spieler-Profil
                     </span>
@@ -684,7 +967,7 @@ function WortBlitzApp() {
                       setProfile((p) => ({ ...p, name: e.target.value }))
                     }
                     maxLength={24}
-                    placeholder="Dein Spitzname"
+                    placeholder="Dein Spitzname (z. B. Mama, Tim…)"
                     className="w-full min-h-[44px] px-4 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400"
                   />
 
@@ -706,158 +989,183 @@ function WortBlitzApp() {
                     ))}
                   </div>
                 </div>
+              )}
 
-                {homeMode === 'CREATE' ? (
-                  <form onSubmit={handleCreateRoom} className="space-y-4">
-                    {/* Theme Deck Picker */}
-                    <div className="p-4 rounded-2xl bg-[#161923] border border-white/10 flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="text-xs text-slate-400">Themen-Deck</div>
-                        <div className="text-sm font-bold text-amber-400 truncate">
-                          {setupCategory} ({setupThemes.length} Themen)
+              {homeMode === 'CREATE' ? (
+                <form onSubmit={handleCreateRoom} className="space-y-3.5">
+                  {/* Tablet / Tisch-Modus Switch */}
+                  <label className="flex items-center justify-between gap-3 p-3.5 rounded-2xl bg-sky-500/10 border border-sky-400/30 cursor-pointer">
+                    <div className="flex items-start gap-2.5">
+                      <Monitor className="w-5 h-5 text-sky-300 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="text-xs font-bold text-white">
+                          Dieses Gerät als Tisch-Bildschirm nutzen (ohne eigene Karten)
+                        </div>
+                        <div className="text-[11px] text-slate-300">
+                          Ideal für ein Tablet in der Tischmitte mit großem Thema &amp; zentraler Sprachausgabe.
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setDeckModalOpen(true)}
-                        className="min-h-[42px] px-3.5 rounded-xl bg-white/10 hover:bg-white/15 text-xs font-semibold text-white flex items-center gap-1.5 shrink-0"
-                      >
-                        <FolderCog className="w-4 h-4 text-amber-400" />
-                        <span>Baukasten / KI</span>
-                      </button>
                     </div>
+                    <input
+                      type="checkbox"
+                      checked={setupTableMode}
+                      onChange={(e) => setSetupTableMode(e.target.checked)}
+                      className="w-5 h-5 accent-sky-400 shrink-0"
+                    />
+                  </label>
 
-                    {/* Quick Settings Grid */}
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-slate-400 block">
-                          Ablauf-Modus
-                        </label>
-                        <select
-                          value={setupTurnMode}
-                          onChange={(e) => setSetupTurnMode(e.target.value as TurnMode)}
-                          className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
-                        >
-                          <option value="SIMULTANEOUS">Alle zugleich</option>
-                          <option value="TURN_BASED">Reihum (Uhrzeigersinn)</option>
-                        </select>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-slate-400 block">
-                          Regel-Variante
-                        </label>
-                        <select
-                          value={setupRuleVariant}
-                          onChange={(e) => setSetupRuleVariant(e.target.value as RuleVariant)}
-                          className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
-                        >
-                          <option value="CHAOS">Familien-Chaos (+2 Aktionen)</option>
-                          <option value="CLASSIC">Klassisch</option>
-                        </select>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-slate-400 block">
-                          Spieleranzahl
-                        </label>
-                        <select
-                          value={setupMaxPlayers}
-                          onChange={(e) => setSetupMaxPlayers(Number(e.target.value))}
-                          className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
-                        >
-                          {[2, 3, 4, 5, 6, 7, 8].map((n) => (
-                            <option key={n} value={n}>
-                              Bis zu {n} Spieler
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-slate-400 block">
-                          Timer pro Thema
-                        </label>
-                        <select
-                          value={setupDuration}
-                          onChange={(e) =>
-                            setSetupDuration(Number(e.target.value) as 15 | 20 | 30)
-                          }
-                          className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
-                        >
-                          <option value={15}>15 Sekunden</option>
-                          <option value={20}>20 Sekunden</option>
-                          <option value={30}>30 Sekunden</option>
-                        </select>
+                  {/* Theme Deck Picker */}
+                  <div className="p-3.5 rounded-2xl bg-[#161923] border border-white/10 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-xs text-slate-400">Themen-Deck</div>
+                      <div className="text-sm font-bold text-amber-400 truncate">
+                        {setupCategory} ({setupThemes.length} Themen)
                       </div>
                     </div>
-
-                    <label className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#161923] border border-white/10 cursor-pointer">
-                      <span className="text-xs font-medium text-slate-200">
-                        Automatische Strafkarte (+1) bei ungültigem Wort
-                      </span>
-                      <input
-                        type="checkbox"
-                        checked={setupPenaltyEnabled}
-                        onChange={(e) => setSetupPenaltyEnabled(e.target.checked)}
-                        className="w-4 h-4 accent-amber-400"
-                      />
-                    </label>
-
-                    {joinError && <p className="text-xs text-rose-400">{joinError}</p>}
-
                     <button
-                      type="submit"
-                      disabled={busyAction || !profile.name.trim()}
-                      className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+                      type="button"
+                      onClick={() => setDeckModalOpen(true)}
+                      className="min-h-[42px] px-3.5 rounded-xl bg-white/10 hover:bg-white/15 text-xs font-semibold text-white flex items-center gap-1.5 shrink-0"
                     >
-                      {busyAction ? (
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                      ) : (
-                        <Plus className="w-5 h-5" />
-                      )}
-                      <span>Lobby mit QR-Code erstellen</span>
+                      <FolderCog className="w-4 h-4 text-amber-400" />
+                      <span>Baukasten / KI</span>
                     </button>
-                  </form>
-                ) : (
-                  <form onSubmit={handleJoinRoom} className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="text-xs font-semibold text-slate-300 block">
-                        4-stelliger Raum-Code
+                  </div>
+
+                  {/* Quick Settings Grid */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-slate-400 block">
+                        Ablauf-Modus
                       </label>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        pattern="[0-9]{4}"
-                        maxLength={4}
-                        value={joinCode}
-                        onChange={(e) =>
-                          setJoinCode(e.target.value.replace(/\D/g, '').slice(0, 4))
-                        }
-                        placeholder="1234"
-                        className="w-full min-h-[56px] px-4 rounded-2xl bg-[#0F1117] border border-white/15 text-center font-mono text-3xl font-bold tracking-[0.25em] text-amber-400 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
-                      />
+                      <select
+                        value={setupTurnMode}
+                        onChange={(e) => setSetupTurnMode(e.target.value as TurnMode)}
+                        className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
+                      >
+                        <option value="SIMULTANEOUS">Alle zugleich</option>
+                        <option value="TURN_BASED">Reihum (Uhrzeigersinn)</option>
+                      </select>
                     </div>
 
-                    {joinError && <p className="text-xs text-rose-400">{joinError}</p>}
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-slate-400 block">
+                        Regel-Variante
+                      </label>
+                      <select
+                        value={setupRuleVariant}
+                        onChange={(e) => setSetupRuleVariant(e.target.value as RuleVariant)}
+                        className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
+                      >
+                        <option value="CHAOS">Familien-Chaos (+2 Aktionen)</option>
+                        <option value="CLASSIC">Klassisch</option>
+                      </select>
+                    </div>
 
-                    <button
-                      type="submit"
-                      disabled={busyAction || joinCode.length !== 4 || !profile.name.trim()}
-                      className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
-                    >
-                      {busyAction ? (
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                      ) : (
-                        <Users className="w-5 h-5" />
-                      )}
-                      <span>Raum beitreten</span>
-                      <ArrowRight className="w-4 h-4" />
-                    </button>
-                  </form>
-                )}
-              </div>
-            )}
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-slate-400 block">
+                        Spieleranzahl
+                      </label>
+                      <select
+                        value={setupMaxPlayers}
+                        onChange={(e) => setSetupMaxPlayers(Number(e.target.value))}
+                        className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
+                      >
+                        {[2, 3, 4, 5, 6, 7, 8].map((n) => (
+                          <option key={n} value={n}>
+                            Bis zu {n} Spieler
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-slate-400 block">
+                        Timer pro Thema
+                      </label>
+                      <select
+                        value={setupDuration}
+                        onChange={(e) =>
+                          setSetupDuration(Number(e.target.value) as 15 | 20 | 30)
+                        }
+                        className="w-full min-h-[44px] px-3 rounded-xl bg-[#0F1117] border border-white/15 text-sm text-white focus:outline-none focus:border-amber-400"
+                      >
+                        <option value={15}>15 Sekunden</option>
+                        <option value={20}>20 Sekunden</option>
+                        <option value={30}>30 Sekunden</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <label className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#161923] border border-white/10 cursor-pointer">
+                    <span className="text-xs font-medium text-slate-200">
+                      Automatische Strafkarte (+1) bei ungültigem Wort
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={setupPenaltyEnabled}
+                      onChange={(e) => setSetupPenaltyEnabled(e.target.checked)}
+                      className="w-4 h-4 accent-amber-400"
+                    />
+                  </label>
+
+                  {joinError && <p className="text-xs text-rose-400">{joinError}</p>}
+
+                  <button
+                    type="submit"
+                    disabled={
+                      busyAction || (!setupTableMode && !profile.name.trim())
+                    }
+                    className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+                  >
+                    {busyAction ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Plus className="w-5 h-5" />
+                    )}
+                    <span>Lobby mit QR-Code erstellen</span>
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={handleJoinRoom} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-xs font-semibold text-slate-300 block">
+                      4-stelliger Raum-Code
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]{4}"
+                      maxLength={4}
+                      value={joinCode}
+                      onChange={(e) =>
+                        setJoinCode(e.target.value.replace(/\D/g, '').slice(0, 4))
+                      }
+                      placeholder="1234"
+                      className="w-full min-h-[56px] px-4 rounded-2xl bg-[#0F1117] border border-white/15 text-center font-mono text-3xl font-bold tracking-[0.25em] text-amber-400 placeholder:text-slate-600 focus:outline-none focus:border-amber-400"
+                    />
+                  </div>
+
+                  {joinError && <p className="text-xs text-rose-400">{joinError}</p>}
+
+                  <button
+                    type="submit"
+                    disabled={
+                      busyAction || joinCode.length !== 4 || !profile.name.trim()
+                    }
+                    className="w-full min-h-[52px] px-6 rounded-2xl bg-amber-400 text-slate-950 font-display font-bold text-base hover:bg-amber-300 disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+                  >
+                    {busyAction ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Users className="w-5 h-5" />
+                    )}
+                    <span>Raum beitreten</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </form>
+              )}
+            </div>
           </div>
         </section>
       </main>
@@ -865,6 +1173,7 @@ function WortBlitzApp() {
       <DeckBuilderModal
         isOpen={deckModalOpen}
         onClose={() => setDeckModalOpen(false)}
+        familyPin={familyPin}
         selectedCategory={setupCategory}
         customDecks={customDecks}
         onSaveCustomDeck={handleSaveCustomDeck}

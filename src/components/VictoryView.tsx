@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import confetti from 'canvas-confetti';
-import { RotateCcw, Trophy } from 'lucide-react';
+import { Bot, RotateCcw, Trophy } from 'lucide-react';
 import { getAvatar } from '../data/themesAndCards';
 import { playVictoryFanfare } from '../lib/soundAndSpeech';
 import type { RoomData } from '../types/game';
@@ -21,6 +21,8 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
   onLeaveRoom,
 }) => {
   const isHost = room.hostUid === myUid;
+  const isTableDisplay = isHost && room.tableDisplayActive;
+  const effectiveMuted = room.tableDisplayActive && !isTableDisplay ? true : muted;
 
   const ranked = [...room.playerOrder]
     .map((uid) => room.playersMeta[uid])
@@ -28,7 +30,7 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
     .sort((a, b) => b.score - a.score);
 
   useEffect(() => {
-    playVictoryFanfare(muted);
+    playVictoryFanfare(effectiveMuted);
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     if (!reduced) {
       confetti({
@@ -38,7 +40,7 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
         colors: ['#F59E0B', '#10B981', '#F43F5E', '#0EA5E9'],
       });
     }
-  }, [muted]);
+  }, [effectiveMuted]);
 
   const podiumOrder = [ranked[1], ranked[0], ranked[2]].filter(Boolean);
 
@@ -57,7 +59,6 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
           </p>
         </div>
 
-        {/* Visual Podium */}
         <div className="grid grid-cols-3 gap-2.5 items-end pt-4">
           {podiumOrder.map((p) => {
             const actualRank = ranked.findIndex((r) => r.uid === p.uid) + 1;
@@ -92,7 +93,6 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
           })}
         </div>
 
-        {/* Full Standings */}
         <div className="rounded-3xl bg-[#1C202E] border border-white/10 p-4 space-y-2">
           {ranked.map((p, idx) => (
             <div
@@ -104,7 +104,10 @@ export const VictoryView: React.FC<VictoryViewProps> = ({
                   {idx + 1}.
                 </span>
                 <span className="text-lg">{getAvatar(p.avatar).emoji}</span>
-                <span className="font-semibold text-sm text-white">{p.name}</span>
+                <span className="font-semibold text-sm text-white flex items-center gap-1.5">
+                  <span>{p.name}</span>
+                  {p.isBot && <Bot className="w-3.5 h-3.5 text-sky-400" />}
+                </span>
               </div>
               <span className="font-mono font-bold text-amber-400 tabular-nums">
                 {p.score} Punkte

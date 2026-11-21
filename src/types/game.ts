@@ -6,20 +6,31 @@ export type RuleVariant = 'CLASSIC' | 'CHAOS';
 
 export type ActionCardType = 'THEME_SWAP' | 'GIFT' | 'TIME_TURBO' | 'SHIELD';
 
+export type BotDifficulty = 'NONE' | 'SLOW' | 'NORMAL' | 'FAST';
+
 export interface PlayerMeta {
   uid: string;
   name: string;
   avatar: string;
   isJunior: boolean;
+  isBot: boolean;
+  botDifficulty: BotDifficulty;
   cardCount: number;
   score: number;
   finishedRound: number;
   secretThemeCount: number;
 }
 
+export interface RoomAnnouncement {
+  id: string;
+  text: string;
+  createdAt: number;
+}
+
 export interface RoomData {
   code: string;
   hostUid: string;
+  tableDisplayActive: boolean;
   status: RoomStatus;
   maxPlayers: number;
   turnMode: TurnMode;
@@ -39,6 +50,8 @@ export interface RoomData {
   usedWords: string[];
   winnersOrder: string[];
   lastActionNotice: string;
+  latestAnnouncement?: RoomAnnouncement | null;
+  createdAtMs: number;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -48,6 +61,8 @@ export interface PlayerData {
   name: string;
   avatar: string;
   isJunior: boolean;
+  isBot: boolean;
+  botDifficulty: BotDifficulty;
   cards: string[];
   cardCount: number;
   actionCards: ActionCardType[];

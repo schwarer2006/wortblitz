@@ -2,7 +2,7 @@
   "entities": {
     "Room": {
       "title": "Room",
-      "description": "Multiplayer WortBlitz game room state, settings, active theme, and round progress.",
+      "description": "Multiplayer WortBlitz game room state, settings, table display mode, active theme, and round progress.",
       "type": "object",
       "properties": {
         "code": {
@@ -14,9 +14,13 @@
         },
         "hostUid": {
           "type": "string",
-          "description": "Firebase Auth UID of the room host.",
+          "description": "Device/Player ID of the room host.",
           "minLength": 1,
           "maxLength": 128
+        },
+        "tableDisplayActive": {
+          "type": "boolean",
+          "description": "Whether the host device acts as a shared Tablet Table Display without its own cards."
         },
         "status": {
           "type": "string",
@@ -25,7 +29,7 @@
         },
         "maxPlayers": {
           "type": "integer",
-          "description": "Maximum allowed players (2 to 8)."
+          "description": "Maximum allowed players including bots (2 to 8)."
         },
         "turnMode": {
           "type": "string",
@@ -83,7 +87,7 @@
         },
         "playerOrder": {
           "type": "array",
-          "description": "Ordered array of joined player UIDs (max 8)."
+          "description": "Ordered array of joined player and bot IDs (max 8)."
         },
         "usedWords": {
           "type": "array",
@@ -91,12 +95,20 @@
         },
         "winnersOrder": {
           "type": "array",
-          "description": "UIDs of players in the order they emptied their hands this round (max 8)."
+          "description": "IDs of players in the order they emptied their hands this round (max 8)."
         },
         "lastActionNotice": {
           "type": "string",
           "description": "Latest game action announcement.",
           "maxLength": 160
+        },
+        "latestAnnouncement": {
+          "type": "object",
+          "description": "Optional latest voice moderator announcement event played on table audio devices."
+        },
+        "createdAtMs": {
+          "type": "number",
+          "description": "Creation epoch milliseconds used for 12-hour automatic room cleanup."
         },
         "createdAt": {
           "type": "string",
@@ -112,6 +124,7 @@
       "required": [
         "code",
         "hostUid",
+        "tableDisplayActive",
         "status",
         "maxPlayers",
         "turnMode",
@@ -130,18 +143,19 @@
         "usedWords",
         "winnersOrder",
         "lastActionNotice",
+        "createdAtMs",
         "createdAt",
         "updatedAt"
       ]
     },
     "Player": {
       "title": "Player",
-      "description": "A participant in a WortBlitz room, including their private card hand and score.",
+      "description": "A human participant or AI bot in a WortBlitz room.",
       "type": "object",
       "properties": {
         "uid": {
           "type": "string",
-          "description": "Firebase Auth UID.",
+          "description": "Player or bot ID.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -160,6 +174,15 @@
         "isJunior": {
           "type": "boolean",
           "description": "Junior / beginner mode flag (7 starting cards + lenient AI judging)."
+        },
+        "isBot": {
+          "type": "boolean",
+          "description": "Whether this participant is an AI bot."
+        },
+        "botDifficulty": {
+          "type": "string",
+          "enum": ["NONE", "SLOW", "NORMAL", "FAST"],
+          "description": "Bot reaction speed tier."
         },
         "cards": {
           "type": "array",
@@ -209,6 +232,8 @@
         "name",
         "avatar",
         "isJunior",
+        "isBot",
+        "botDifficulty",
         "cards",
         "cardCount",
         "actionCards",
@@ -228,13 +253,13 @@
       "properties": {
         "uid": {
           "type": "string",
-          "description": "Author UID.",
+          "description": "Author ID.",
           "minLength": 1,
           "maxLength": 128
         },
         "hostUid": {
           "type": "string",
-          "description": "Room host UID for private host retrieval.",
+          "description": "Room host ID.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -258,7 +283,7 @@
       "properties": {
         "uid": {
           "type": "string",
-          "description": "Player UID.",
+          "description": "Player or bot ID.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -330,7 +355,7 @@
     },
     "ChaosEvent": {
       "title": "ChaosEvent",
-      "description": "Interactive Chaos action card event (e.g. gift card targeting another player).",
+      "description": "Interactive Chaos action card event (e.g. gift card targeting another player or bot).",
       "type": "object",
       "properties": {
         "type": {
@@ -340,7 +365,7 @@
         },
         "fromUid": {
           "type": "string",
-          "description": "Sender UID.",
+          "description": "Sender ID.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -352,7 +377,7 @@
         },
         "toUid": {
           "type": "string",
-          "description": "Target recipient UID.",
+          "description": "Target recipient ID.",
           "minLength": 1,
           "maxLength": 128
         },
@@ -386,7 +411,7 @@
     },
     "/rooms/{roomId}/players/{playerId}": {
       "schema": { "$ref": "#/entities/Player" },
-      "description": "Player profile, score, and card hand within a room."
+      "description": "Player or bot profile, score, and card hand within a room."
     },
     "/rooms/{roomId}/secretThemes/{themeId}": {
       "schema": { "$ref": "#/entities/SecretTheme" },
