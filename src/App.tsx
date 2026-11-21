@@ -37,7 +37,12 @@ import {
   initFirebaseFromConfig,
   OperationType,
 } from './lib/firebase';
-import { authenticateFamilyPin } from './lib/geminiProxy';
+import {
+  authenticateFamilyPin,
+  clearStoredFamilyPin,
+  getStoredFamilyPin,
+  persistFamilyPin,
+} from './lib/geminiProxy';
 import {
   addBotToLobby,
   advanceTheme,
@@ -58,11 +63,14 @@ import {
   recordAcceptedWord,
   recordRejectedWord,
   removeBotFromLobby,
+  resolveChaosBlockEvent,
   resolveChaosGiftEvent,
   ROUND_END_DELAY_MS,
+  sendChaosBlock,
   sendChaosGift,
   startMatch,
   submitSecretLobbyTheme,
+  swapSingleLetterCard,
   transitionCountdownToPlaying,
   undoWordEntry,
   updateBotDifficultyInLobby,
@@ -89,7 +97,6 @@ import type {
 const PROFILE_STORAGE_KEY = 'wortblitz_profile_v1';
 const CUSTOM_DECKS_STORAGE_KEY = 'wortblitz_custom_decks_v1';
 const ACTIVE_ROOM_STORAGE_KEY = 'wortblitz_active_room_v1';
-const FAMILY_PIN_STORAGE_KEY = 'wortblitz_family_pin_v1';
 const TABLE_AUDIO_STORAGE_KEY = 'wortblitz_table_audio_device_v1';
 
 function loadStoredProfile(): LocalPlayerProfile {
@@ -224,14 +231,13 @@ function WortBlitzApp() {
         setJoinCode(urlRoom);
       }
 
-      const candidatePin =
-        urlPin?.trim() || localStorage.getItem(FAMILY_PIN_STORAGE_KEY)?.trim() || '';
+      const candidatePin = urlPin?.trim() || getStoredFamilyPin();
 
       if (candidatePin) {
         const res = await authenticateFamilyPin(candidatePin);
         if (!active) return;
         if (res.ok) {
-          localStorage.setItem(FAMILY_PIN_STORAGE_KEY, candidatePin);
+          persistFamilyPin(candidatePin);
           setFamilyPin(candidatePin);
           if (urlPin) {
             // Strip pin from URL bar after automatic login
@@ -239,7 +245,7 @@ function WortBlitzApp() {
             window.history.replaceState({}, '', cleanUrl);
           }
         } else {
-          localStorage.removeItem(FAMILY_PIN_STORAGE_KEY);
+          clearStoredFamilyPin();
           setFamilyPin(null);
           if (urlPin) {
             setPinError('Der Link-Zugangscode ist ungültig oder abgelaufen.');
@@ -451,7 +457,7 @@ function WortBlitzApp() {
   useBotRunner({
     room,
     isHost,
-    familyPin: familyPin ?? '',
+    familyPin: (familyPin ?? '').trim() || getStoredFamilyPin(),
     onBotPlayedWord: () => {
       if (isTableAudioDevice && !muted) {
         playSuccessChime(false);
@@ -500,7 +506,7 @@ function WortBlitzApp() {
     const res = await authenticateFamilyPin(pinInput);
     if (res.ok) {
       const cleanPin = pinInput.trim();
-      localStorage.setItem(FAMILY_PIN_STORAGE_KEY, cleanPin);
+      persistFamilyPin(cleanPin);
       setFamilyPin(cleanPin);
       setPinInput('');
     } else {
@@ -513,7 +519,7 @@ function WortBlitzApp() {
     stopModeratorSpeech();
     initialAnnouncementSyncedRoomRef.current = null;
     lastSpokenAnnouncementIdRef.current = null;
-    localStorage.removeItem(FAMILY_PIN_STORAGE_KEY);
+    clearStoredFamilyPin();
     sessionStorage.removeItem(ACTIVE_ROOM_STORAGE_KEY);
     setFamilyPin(null);
     setActiveRoomCode(null);
@@ -753,7 +759,7 @@ function WortBlitzApp() {
           <GameView
             room={room}
             myUid={myUid}
-            familyPin={familyPin}
+            familyPin={(familyPin ?? '').trim() || getStoredFamilyPin()}
             myPlayer={myPlayer}
             feedEntries={feedEntries}
             pendingGifts={pendingGifts}
@@ -772,6 +778,9 @@ function WortBlitzApp() {
             onRejectWord={(params) =>
               recordRejectedWord({ room, player: myPlayer, ...params })
             }
+            onSwapCard={(cardIndex) =>
+              swapSingleLetterCard(room, myPlayer, cardIndex)
+            }
             onUndoEntry={(entry, normalizedWord) =>
               undoWordEntry({ room, player: myPlayer, entry, normalizedWord })
             }
@@ -789,6 +798,17 @@ function WortBlitzApp() {
                 player: myPlayer,
                 eventId: event.id,
                 letter: event.letter,
+                useShield,
+              })
+            }
+            onSendBlock={(targetUid, targetName) =>
+              sendChaosBlock({ room, sender: myPlayer, targetUid, targetName })
+            }
+            onResolveBlock={(event, useShield) =>
+              resolveChaosBlockEvent({
+                room,
+                player: myPlayer,
+                eventId: event.id,
                 useShield,
               })
             }

@@ -17,8 +17,11 @@ import {
   pickBotMoveLine,
   pickGiftCardLine,
   pickHandFinishedLine,
+  pickIceBlockLine,
   pickInvalidWordLine,
+  pickJokerPlayedLine,
   pickLowCardsLine,
+  pickRareLetterWordLine,
   pickRoundEndLine,
   pickRoundStartLine,
   pickShieldBlockLine,
@@ -27,13 +30,16 @@ import {
   pickTimeUpThemeLine,
   pickValidWordHighlightLine,
   pickVictoryLine,
+  pickWrongLetterLine,
 } from '../data/moderatorLines';
 import {
   AVATARS,
   calculateRoundPoints,
   dealActionCards,
   dealLetterHand,
+  drawEmergencySwapLetter,
   drawSingleLetterCard,
+  isRareLetter,
   shuffleArray,
 } from '../data/themesAndCards';
 import type {
@@ -212,6 +218,8 @@ export async function createRoom(
       finishedRound: 0,
       lastScoredRound: 0,
       secretThemeCount: 0,
+      blockedUntil: 0,
+      swappedRound: 0,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
@@ -277,6 +285,8 @@ export async function joinRoom(
           finishedRound: 0,
           lastScoredRound: 0,
           secretThemeCount: 0,
+          blockedUntil: 0,
+          swappedRound: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -334,6 +344,8 @@ export async function joinRoom(
     finishedRound: 0,
     lastScoredRound: 0,
     secretThemeCount: 0,
+    blockedUntil: 0,
+    swappedRound: 0,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -391,6 +403,8 @@ export async function addBotToLobby(
     finishedRound: 0,
     lastScoredRound: 0,
     secretThemeCount: 0,
+    blockedUntil: 0,
+    swappedRound: 0,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -574,6 +588,8 @@ export async function dealHandForParticipant(
       actionCards,
       roundDealt: roundNumber,
       finishedRound: 0,
+      blockedUntil: 0,
+      ...(roundNumber === 1 ? { swappedRound: 0 } : {}),
       updatedAt: serverTimestamp(),
     });
     await updateDoc(doc(db, 'rooms', code), {
@@ -885,10 +901,13 @@ export async function recordAcceptedWord(params: {
         announcementText = pickHandFinishedLine(latestPlayer.name);
       } else if (newCards.length <= 2) {
         announcementText = pickLowCardsLine(latestPlayer.name, newCards.length);
+      } else if (matchedLetter === 'JOKER') {
+        announcementText = pickJokerPlayedLine(latestPlayer.name);
+      } else if (isRareLetter(matchedLetter)) {
+        announcementText = pickRareLetterWordLine(latestPlayer.name, matchedLetter);
       } else if (latestPlayer.isBot) {
         announcementText = pickBotMoveLine(latestPlayer.name);
       } else if (
-        matchedLetter === 'JOKER' ||
         latestRoom.usedWords.length === 0 ||
         Math.random() < 0.45
       ) {
@@ -906,7 +925,7 @@ export async function recordAcceptedWord(params: {
       });
 
       const roomUpdates: Record<string, unknown> = {
-        usedWords: [...latestRoom.usedWords, normalizedWord].slice(0, 100),
+        usedWords: [...latestRoom.usedWords, normalizedWord.slice(0, 100)].slice(0, 100),
         winnersOrder: newWinnersOrder,
         // Keep status 'PLAYING' during the 1.2s delay; set turnEndsAt to 0 to halt timer immediately
         status: latestRoom.status,
@@ -954,7 +973,7 @@ export async function recordAcceptedWord(params: {
       uid: player.uid,
       playerName: player.name,
       avatar: player.avatar,
-      word: word.slice(0, 64),
+      word: word.slice(0, 100),
       letter: matchedLetter,
       theme: txResult.activeTheme.slice(0, 120),
       roundNumber: txResult.roundNumber,
@@ -988,42 +1007,73 @@ export async function recordRejectedWord(params: {
   word: string;
   reason: string;
   penaltyApplied: boolean;
+  wrongLetter?: boolean;
+  expectedLetter?: string;
 }): Promise<{ feedId: string; penaltyCard: string | null }> {
   const db = getDb();
-  const { room, player, word, reason, penaltyApplied } = params;
-  let penaltyCard: string | null = null;
-  let newCards = [...player.cards];
+  const {
+    room,
+    player,
+    word,
+    reason,
+    penaltyApplied,
+    wrongLetter = false,
+    expectedLetter,
+  } = params;
 
-  if (penaltyApplied) {
-    penaltyCard = drawSingleLetterCard();
-    newCards = [...newCards, penaltyCard].slice(0, 25);
-    try {
-      await updateDoc(doc(db, 'rooms', room.code, 'players', player.uid), {
-        cards: newCards,
-        cardCount: newCards.length,
+  let penaltyCard: string | null = null;
+  let activeTheme = room.currentTheme;
+  let roundNumber = room.roundNumber;
+  let playerOrder = room.playerOrder;
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const roomRef = doc(db, 'rooms', room.code);
+      const playerRef = doc(db, 'rooms', room.code, 'players', player.uid);
+
+      const [roomSnap, playerSnap] = await Promise.all([
+        tx.get(roomRef),
+        tx.get(playerRef),
+      ]);
+      if (!roomSnap.exists() || !playerSnap.exists()) return;
+
+      const latestRoom = roomSnap.data() as RoomData;
+      const latestPlayer = playerSnap.data() as PlayerData;
+      activeTheme = latestRoom.currentTheme;
+      roundNumber = latestRoom.roundNumber;
+      playerOrder = latestRoom.playerOrder;
+
+      const nextScore = Math.max(-50, latestPlayer.score - 1);
+      let nextCards = [...latestPlayer.cards];
+
+      if (penaltyApplied) {
+        penaltyCard = drawSingleLetterCard();
+        nextCards = [...nextCards, penaltyCard].slice(0, 25);
+      }
+
+      const announcementText = wrongLetter
+        ? pickWrongLetterLine(latestPlayer.name, word, expectedLetter)
+        : pickInvalidWordLine(word, latestRoom.currentTheme);
+
+      tx.update(playerRef, {
+        cards: nextCards,
+        cardCount: nextCards.length,
+        score: nextScore,
         updatedAt: serverTimestamp(),
       });
-      await updateDoc(doc(db, 'rooms', room.code), {
-        [`playersMeta.${player.uid}.cardCount`]: newCards.length,
-        latestAnnouncement: createAnnouncement(
-          pickInvalidWordLine(word, room.currentTheme)
-        ),
+
+      tx.update(roomRef, {
+        [`playersMeta.${player.uid}.cardCount`]: nextCards.length,
+        [`playersMeta.${player.uid}.score`]: nextScore,
+        lastActionNotice: penaltyCard
+          ? `${latestPlayer.name}: "${word}" (-1 P. & +1 Karte)`
+          : `${latestPlayer.name}: "${word}" (-1 Strafpunkt)`,
+        latestAnnouncement: createAnnouncement(announcementText),
         updatedAt: serverTimestamp(),
       });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}/players/${player.uid}`);
-    }
-  } else {
-    try {
-      await updateDoc(doc(db, 'rooms', room.code), {
-        latestAnnouncement: createAnnouncement(
-          pickInvalidWordLine(word, room.currentTheme)
-        ),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}`);
-    }
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}/players/${player.uid}`);
   }
 
   let feedId = '';
@@ -1032,14 +1082,14 @@ export async function recordRejectedWord(params: {
       uid: player.uid,
       playerName: player.name,
       avatar: player.avatar,
-      word: word.slice(0, 64),
-      letter: penaltyCard ? `+${penaltyCard}` : '-',
-      theme: room.currentTheme.slice(0, 120),
-      roundNumber: room.roundNumber,
+      word: word.slice(0, 100),
+      letter: penaltyCard ? `-1P+${penaltyCard}` : '-1P',
+      theme: activeTheme.slice(0, 120),
+      roundNumber,
       valid: false,
       reason: reason.slice(0, 200),
       undone: false,
-      visibleTo: room.playerOrder,
+      visibleTo: playerOrder,
       createdAt: serverTimestamp(),
     });
     feedId = feedRef.id;
@@ -1048,6 +1098,72 @@ export async function recordRejectedWord(params: {
   }
 
   return { feedId, penaltyCard };
+}
+
+export async function swapSingleLetterCard(
+  room: RoomData,
+  player: PlayerData,
+  cardIndex: number
+): Promise<
+  | { ok: true; oldLetter: string; newLetter: string }
+  | { ok: false; reason: string }
+> {
+  const db = getDb();
+  let outcome:
+    | { ok: true; oldLetter: string; newLetter: string }
+    | { ok: false; reason: string } = {
+    ok: false,
+    reason: 'Kartentausch derzeit nicht möglich.',
+  };
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const roomRef = doc(db, 'rooms', room.code);
+      const playerRef = doc(db, 'rooms', room.code, 'players', player.uid);
+      const [roomSnap, playerSnap] = await Promise.all([
+        tx.get(roomRef),
+        tx.get(playerRef),
+      ]);
+      if (!roomSnap.exists() || !playerSnap.exists()) return;
+
+      const latestRoom = roomSnap.data() as RoomData;
+      const latestPlayer = playerSnap.data() as PlayerData;
+
+      if (latestRoom.status !== 'PLAYING' || latestRoom.turnEndsAt === 0) {
+        outcome = { ok: false, reason: 'Tausch nur während des laufenden Zuges möglich.' };
+        return;
+      }
+      if ((latestPlayer.swappedRound ?? 0) >= latestRoom.roundNumber) {
+        outcome = { ok: false, reason: 'Du hast deinen Notfall-Tausch in dieser Runde bereits genutzt.' };
+        return;
+      }
+      if (cardIndex < 0 || cardIndex >= latestPlayer.cards.length) {
+        outcome = { ok: false, reason: 'Bitte wähle eine gültige Karte aus.' };
+        return;
+      }
+
+      const oldLetter = latestPlayer.cards[cardIndex];
+      const newLetter = drawEmergencySwapLetter(latestPlayer.cards);
+      const nextCards = [...latestPlayer.cards];
+      nextCards[cardIndex] = newLetter;
+
+      tx.update(playerRef, {
+        cards: nextCards,
+        swappedRound: latestRoom.roundNumber,
+        updatedAt: serverTimestamp(),
+      });
+      tx.update(roomRef, {
+        lastActionNotice: `🔁 ${latestPlayer.name} nutzt Notfall-Tausch (${oldLetter} → ${newLetter})`,
+        updatedAt: serverTimestamp(),
+      });
+
+      outcome = { ok: true, oldLetter, newLetter };
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}/players/${player.uid}`);
+  }
+
+  return outcome;
 }
 
 export async function undoWordEntry(params: {
@@ -1083,12 +1199,23 @@ export async function undoWordEntry(params: {
 
       if (entry.valid && entry.letter) {
         nextCards = [...nextCards, entry.letter].slice(0, 25);
-        nextScore = Math.max(0, latestPlayer.score - 1);
-      } else if (!entry.valid && entry.letter.startsWith('+')) {
-        const addedCard = entry.letter.slice(1);
-        const idx = nextCards.lastIndexOf(addedCard);
-        if (idx !== -1) {
-          nextCards.splice(idx, 1);
+        nextScore = Math.max(-50, latestPlayer.score - 1);
+      } else if (!entry.valid) {
+        if (entry.letter.startsWith('-1P')) {
+          nextScore = Math.min(200, latestPlayer.score + 1);
+          if (entry.letter.startsWith('-1P+')) {
+            const addedCard = entry.letter.slice(4);
+            const idx = nextCards.lastIndexOf(addedCard);
+            if (idx !== -1) {
+              nextCards.splice(idx, 1);
+            }
+          }
+        } else if (entry.letter.startsWith('+')) {
+          const addedCard = entry.letter.slice(1);
+          const idx = nextCards.lastIndexOf(addedCard);
+          if (idx !== -1) {
+            nextCards.splice(idx, 1);
+          }
         }
       }
 
@@ -1210,13 +1337,6 @@ export async function sendChaosGift(params: {
   if (giftIdx !== -1) nextActions.splice(giftIdx, 1);
 
   const hasFinished = nextCards.length === 0;
-  const newWinnersOrder =
-    hasFinished && !room.winnersOrder.includes(sender.uid)
-      ? [...room.winnersOrder, sender.uid]
-      : room.winnersOrder;
-  const remainingPlayers = room.playerOrder.filter((u) => !newWinnersOrder.includes(u));
-  const shouldEndRound = remainingPlayers.length <= 1;
-
   const targetIsBot = Boolean(room.playersMeta[targetUid]?.isBot);
 
   try {
@@ -1229,7 +1349,14 @@ export async function sendChaosGift(params: {
     });
 
     if (targetIsBot) {
-      // Host/bot resolves gift immediately (bot blocks with SHIELD if available)
+      // Bot resolves gift synchronously -> safe to evaluate round end right away
+      const newWinnersOrder =
+        hasFinished && !room.winnersOrder.includes(sender.uid)
+          ? [...room.winnersOrder, sender.uid]
+          : room.winnersOrder;
+      const remainingPlayers = room.playerOrder.filter((u) => !newWinnersOrder.includes(u));
+      const shouldEndRound = room.playerOrder.length >= 2 && remainingPlayers.length <= 1;
+
       const botSnap = await getDoc(doc(db, 'rooms', room.code, 'players', targetUid));
       if (botSnap.exists()) {
         const bot = botSnap.data() as PlayerData;
@@ -1288,12 +1415,21 @@ export async function sendChaosGift(params: {
       }
     }
 
+    // Human recipient: defer winnersOrder/turnEndsAt/finalizeRoundEndAfterDelay until PENDING gift is resolved!
+    const nextTurnUpdates =
+      hasFinished &&
+      room.turnMode === 'TURN_BASED' &&
+      room.activeTurnUid === sender.uid
+        ? {
+            activeTurnUid: getNextActiveTurnUid(room, sender.uid),
+            turnEndsAt: Date.now() + room.roundDurationSec * 1000,
+          }
+        : {};
+
     await updateDoc(doc(db, 'rooms', room.code), {
-      winnersOrder: newWinnersOrder,
-      turnEndsAt: shouldEndRound ? 0 : room.turnEndsAt,
-      activeTurnUid: shouldEndRound ? '' : room.activeTurnUid,
       [`playersMeta.${sender.uid}.cardCount`]: nextCards.length,
       [`playersMeta.${sender.uid}.finishedRound`]: hasFinished ? room.roundNumber : sender.finishedRound,
+      ...nextTurnUpdates,
       lastActionNotice: `🎁 ${sender.name} schenkt ${targetName} eine Karte!`,
       latestAnnouncement: createAnnouncement(
         pickGiftCardLine(sender.name, targetName)
@@ -1301,13 +1437,7 @@ export async function sendChaosGift(params: {
       updatedAt: serverTimestamp(),
     });
 
-    if (shouldEndRound) {
-      window.setTimeout(() => {
-        finalizeRoundEndAfterDelay(room.code, room.roundNumber);
-      }, ROUND_END_DELAY_MS);
-    }
-
-    await addDoc(collection(db, 'rooms', room.code, 'events'), {
+    const eventRef = await addDoc(collection(db, 'rooms', room.code, 'events'), {
       type: 'GIFT',
       fromUid: sender.uid,
       fromName: sender.name,
@@ -1317,8 +1447,57 @@ export async function sendChaosGift(params: {
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+
+    // 6-second safety timeout so a pending last-card gift never stalls the round forever
+    const expectedRound = room.roundNumber;
+    window.setTimeout(() => {
+      autoResolvePendingGiftOnTimeout({
+        roomCode: room.code,
+        eventId: eventRef.id,
+        expectedRound,
+      });
+    }, 6000);
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `rooms/${room.code}/events`);
+  }
+}
+
+async function autoResolvePendingGiftOnTimeout(params: {
+  roomCode: string;
+  eventId: string;
+  expectedRound: number;
+}): Promise<void> {
+  const db = getDb();
+  const { roomCode, eventId, expectedRound } = params;
+  try {
+    const eventSnap = await getDoc(doc(db, 'rooms', roomCode, 'events', eventId));
+    if (!eventSnap.exists()) return;
+    const evt = eventSnap.data() as {
+      status: string;
+      toUid: string;
+      letter: string;
+    };
+    if (evt.status !== 'PENDING') return;
+
+    const [roomSnap, targetSnap] = await Promise.all([
+      getDoc(doc(db, 'rooms', roomCode)),
+      getDoc(doc(db, 'rooms', roomCode, 'players', evt.toUid)),
+    ]);
+    if (!roomSnap.exists() || !targetSnap.exists()) return;
+    const latestRoom = roomSnap.data() as RoomData;
+    if (latestRoom.status !== 'PLAYING' || latestRoom.roundNumber !== expectedRound) {
+      return;
+    }
+
+    await resolveChaosGiftEvent({
+      room: latestRoom,
+      player: targetSnap.data() as PlayerData,
+      eventId,
+      letter: evt.letter,
+      useShield: false,
+    });
+  } catch (error) {
+    console.warn('Hinweis bei automatischer Geschenk-Auflösung:', error);
   }
 }
 
@@ -1332,37 +1511,229 @@ export async function resolveChaosGiftEvent(params: {
   const db = getDb();
   const { room, player, eventId, letter, useShield } = params;
 
+  let shouldEndRoundAfterResolve = false;
+  let resolvedRoundNumber = room.roundNumber;
+
   try {
-    await updateDoc(doc(db, 'rooms', room.code, 'events', eventId), {
-      status: useShield ? 'BLOCKED' : 'ACCEPTED',
+    await runTransaction(db, async (tx) => {
+      const eventRef = doc(db, 'rooms', room.code, 'events', eventId);
+      const roomRef = doc(db, 'rooms', room.code);
+      const targetRef = doc(db, 'rooms', room.code, 'players', player.uid);
+
+      const [eventSnap, roomSnap, targetSnap] = await Promise.all([
+        tx.get(eventRef),
+        tx.get(roomRef),
+        tx.get(targetRef),
+      ]);
+      if (!eventSnap.exists() || !roomSnap.exists() || !targetSnap.exists()) return;
+
+      const evt = eventSnap.data() as { status: string; fromUid: string };
+      if (evt.status !== 'PENDING') return;
+
+      const latestRoom = roomSnap.data() as RoomData;
+      const latestTarget = targetSnap.data() as PlayerData;
+      resolvedRoundNumber = latestRoom.roundNumber;
+
+      const senderRef = doc(db, 'rooms', room.code, 'players', evt.fromUid);
+      const senderSnap = await tx.get(senderRef);
+      const senderFinished =
+        senderSnap.exists() && (senderSnap.data() as PlayerData).cardCount === 0;
+
+      tx.update(eventRef, {
+        status: useShield ? 'BLOCKED' : 'ACCEPTED',
+        updatedAt: serverTimestamp(),
+      });
+
+      let nextWinnersOrder = [...latestRoom.winnersOrder];
+      if (senderFinished && !nextWinnersOrder.includes(evt.fromUid)) {
+        nextWinnersOrder.push(evt.fromUid);
+      }
+
+      const roomUpdates: Record<string, unknown> = {
+        updatedAt: serverTimestamp(),
+      };
+
+      if (useShield) {
+        const nextActions = [...latestTarget.actionCards];
+        const shieldIdx = nextActions.indexOf('SHIELD');
+        if (shieldIdx !== -1) nextActions.splice(shieldIdx, 1);
+
+        tx.update(targetRef, {
+          actionCards: nextActions,
+          updatedAt: serverTimestamp(),
+        });
+
+        roomUpdates.lastActionNotice = `🛡️ ${latestTarget.name} blockt das Karten-Geschenk ab!`;
+        roomUpdates.latestAnnouncement = createAnnouncement(
+          pickShieldBlockLine(latestTarget.name)
+        );
+      } else {
+        const nextCards = [...latestTarget.cards, letter].slice(0, 25);
+        nextWinnersOrder = nextWinnersOrder.filter((u) => u !== latestTarget.uid);
+
+        tx.update(targetRef, {
+          cards: nextCards,
+          cardCount: nextCards.length,
+          finishedRound: 0,
+          updatedAt: serverTimestamp(),
+        });
+
+        roomUpdates[`playersMeta.${latestTarget.uid}.cardCount`] = nextCards.length;
+        roomUpdates[`playersMeta.${latestTarget.uid}.finishedRound`] = 0;
+      }
+
+      const remainingPlayers = latestRoom.playerOrder.filter(
+        (u) => !nextWinnersOrder.includes(u)
+      );
+      const shouldEndRound =
+        latestRoom.status === 'PLAYING' &&
+        latestRoom.playerOrder.length >= 2 &&
+        remainingPlayers.length <= 1;
+
+      roomUpdates.winnersOrder = nextWinnersOrder;
+      if (shouldEndRound) {
+        roomUpdates.turnEndsAt = 0;
+        roomUpdates.activeTurnUid = '';
+        shouldEndRoundAfterResolve = true;
+      }
+
+      tx.update(roomRef, roomUpdates);
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}/events/${eventId}`);
+  }
+
+  if (shouldEndRoundAfterResolve) {
+    window.setTimeout(() => {
+      finalizeRoundEndAfterDelay(room.code, resolvedRoundNumber);
+    }, ROUND_END_DELAY_MS);
+  }
+}
+
+export async function sendChaosBlock(params: {
+  room: RoomData;
+  sender: PlayerData;
+  targetUid: string;
+  targetName: string;
+}): Promise<void> {
+  const db = getDb();
+  const { room, sender, targetUid, targetName } = params;
+  await consumeActionCard(room.code, sender, 'BLOCK_PLAYER');
+
+  const targetIsBot = Boolean(room.playersMeta[targetUid]?.isBot);
+
+  try {
+    if (targetIsBot) {
+      const botSnap = await getDoc(doc(db, 'rooms', room.code, 'players', targetUid));
+      if (botSnap.exists()) {
+        const bot = botSnap.data() as PlayerData;
+        const shieldIdx = bot.actionCards.indexOf('SHIELD');
+        if (shieldIdx !== -1) {
+          const nextBotActions = [...bot.actionCards];
+          nextBotActions.splice(shieldIdx, 1);
+          await updateDoc(doc(db, 'rooms', room.code, 'players', targetUid), {
+            actionCards: nextBotActions,
+            updatedAt: serverTimestamp(),
+          });
+          await updateDoc(doc(db, 'rooms', room.code), {
+            lastActionNotice: `🛡️ ${targetName} wehrt Eisblock von ${sender.name} mit Schutzschild ab!`,
+            latestAnnouncement: createAnnouncement(pickShieldBlockLine(targetName)),
+            updatedAt: serverTimestamp(),
+          });
+          return;
+        }
+        await updateDoc(doc(db, 'rooms', room.code, 'players', targetUid), {
+          blockedUntil: Date.now() + 6000,
+          updatedAt: serverTimestamp(),
+        });
+        await updateDoc(doc(db, 'rooms', room.code), {
+          lastActionNotice: `❄️ ${sender.name} friert ${targetName} für 6 Sekunden ein!`,
+          latestAnnouncement: createAnnouncement(
+            pickIceBlockLine(sender.name, targetName)
+          ),
+          updatedAt: serverTimestamp(),
+        });
+        return;
+      }
+    }
+
+    await updateDoc(doc(db, 'rooms', room.code), {
+      lastActionNotice: `❄️ ${sender.name} wirft einen Eisblock auf ${targetName}!`,
+      latestAnnouncement: createAnnouncement(
+        pickIceBlockLine(sender.name, targetName)
+      ),
       updatedAt: serverTimestamp(),
     });
 
-    if (useShield) {
-      const nextActions = [...player.actionCards];
-      const shieldIdx = nextActions.indexOf('SHIELD');
-      if (shieldIdx !== -1) nextActions.splice(shieldIdx, 1);
-      await updateDoc(doc(db, 'rooms', room.code, 'players', player.uid), {
-        actionCards: nextActions,
+    await addDoc(collection(db, 'rooms', room.code, 'events'), {
+      type: 'BLOCK',
+      fromUid: sender.uid,
+      fromName: sender.name,
+      toUid: targetUid,
+      letter: 'ICE',
+      status: 'PENDING',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `rooms/${room.code}/events`);
+  }
+}
+
+export async function resolveChaosBlockEvent(params: {
+  room: RoomData;
+  player: PlayerData;
+  eventId: string;
+  useShield: boolean;
+}): Promise<void> {
+  const db = getDb();
+  const { room, player, eventId, useShield } = params;
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const eventRef = doc(db, 'rooms', room.code, 'events', eventId);
+      const roomRef = doc(db, 'rooms', room.code);
+      const targetRef = doc(db, 'rooms', room.code, 'players', player.uid);
+
+      const [eventSnap, targetSnap] = await Promise.all([
+        tx.get(eventRef),
+        tx.get(targetRef),
+      ]);
+      if (!eventSnap.exists() || !targetSnap.exists()) return;
+      if ((eventSnap.data() as { status: string }).status !== 'PENDING') return;
+
+      const latestTarget = targetSnap.data() as PlayerData;
+      tx.update(eventRef, {
+        status: useShield ? 'BLOCKED' : 'ACCEPTED',
         updatedAt: serverTimestamp(),
       });
-      await updateDoc(doc(db, 'rooms', room.code), {
-        lastActionNotice: `🛡️ ${player.name} blockt das Karten-Geschenk ab!`,
-        latestAnnouncement: createAnnouncement(pickShieldBlockLine(player.name)),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      const nextCards = [...player.cards, letter].slice(0, 25);
-      await updateDoc(doc(db, 'rooms', room.code, 'players', player.uid), {
-        cards: nextCards,
-        cardCount: nextCards.length,
-        updatedAt: serverTimestamp(),
-      });
-      await updateDoc(doc(db, 'rooms', room.code), {
-        [`playersMeta.${player.uid}.cardCount`]: nextCards.length,
-        updatedAt: serverTimestamp(),
-      });
-    }
+
+      if (useShield) {
+        const nextActions = [...latestTarget.actionCards];
+        const shieldIdx = nextActions.indexOf('SHIELD');
+        if (shieldIdx !== -1) nextActions.splice(shieldIdx, 1);
+        tx.update(targetRef, {
+          actionCards: nextActions,
+          updatedAt: serverTimestamp(),
+        });
+        tx.update(roomRef, {
+          lastActionNotice: `🛡️ ${latestTarget.name} wehrt den Eisblock ab!`,
+          latestAnnouncement: createAnnouncement(
+            pickShieldBlockLine(latestTarget.name)
+          ),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        tx.update(targetRef, {
+          blockedUntil: Date.now() + 6000,
+          updatedAt: serverTimestamp(),
+        });
+        tx.update(roomRef, {
+          lastActionNotice: `❄️ ${latestTarget.name} ist für 6 Sekunden eingefroren!`,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `rooms/${room.code}/events/${eventId}`);
   }
@@ -1374,7 +1745,7 @@ export async function claimMyRoundPoints(room: RoomData, player: PlayerData): Pr
 
   const rankIndex = room.winnersOrder.indexOf(player.uid);
   const earned = calculateRoundPoints(rankIndex, room.playerOrder.length);
-  const newScore = player.score + earned;
+  const newScore = Math.min(200, Math.max(-50, player.score + earned));
 
   try {
     await updateDoc(doc(db, 'rooms', room.code, 'players', player.uid), {
@@ -1405,7 +1776,7 @@ export async function hostClaimBotRoundPoints(room: RoomData): Promise<void> {
 
       const rankIndex = room.winnersOrder.indexOf(botUid);
       const earned = calculateRoundPoints(rankIndex, room.playerOrder.length);
-      const newScore = bot.score + earned;
+      const newScore = Math.min(200, Math.max(-50, bot.score + earned));
 
       await updateDoc(doc(db, 'rooms', room.code, 'players', botUid), {
         score: newScore,

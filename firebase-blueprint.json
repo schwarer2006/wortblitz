@@ -216,6 +216,14 @@
           "type": "integer",
           "description": "Number of secret lobby themes submitted by this player (0 to 2)."
         },
+        "blockedUntil": {
+          "type": "number",
+          "description": "Optional epoch milliseconds until which the player is frozen by an Ice Block card."
+        },
+        "swappedRound": {
+          "type": "integer",
+          "description": "Optional latest round number in which the player used their 1x emergency card swap."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",
@@ -301,9 +309,9 @@
         },
         "word": {
           "type": "string",
-          "description": "Spoken or played word.",
+          "description": "Spoken or played word or sentence.",
           "minLength": 1,
-          "maxLength": 64
+          "maxLength": 100
         },
         "letter": {
           "type": "string",
@@ -360,7 +368,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["GIFT"],
+          "enum": ["GIFT", "BLOCK"],
           "description": "Chaos action event type."
         },
         "fromUid": {

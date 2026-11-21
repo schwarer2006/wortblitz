@@ -1,17 +1,23 @@
 import { useEffect, useRef } from 'react';
 import { findLocalBotWord } from '../data/localBotWords';
 import {
-  extractStartingLetter,
+  findBestMatchingCard,
+  isRareLetter,
   normalizeWord,
+  shuffleArray,
   stripGermanArticle,
 } from '../data/themesAndCards';
-import { generateBotWordsViaProxy } from '../lib/geminiProxy';
+import { generateBotWordsViaProxy, getStoredFamilyPin } from '../lib/geminiProxy';
 import {
   BOT_DIFFICULTY_META,
   getBotPlayerData,
+  playChaosThemeSwap,
+  playChaosTimeTurbo,
   recordAcceptedWord,
+  sendChaosBlock,
+  sendChaosGift,
 } from '../lib/roomService';
-import type { RoomData } from '../types/game';
+import type { ActionCardType, RoomData } from '../types/game';
 
 interface UseBotRunnerOptions {
   room: RoomData | null;
@@ -33,7 +39,8 @@ export function useBotRunner({
   onBotPlayedRef.current = onBotPlayedWord;
 
   useEffect(() => {
-    if (!isHost || !room || room.status !== 'PLAYING' || !familyPin) {
+    const effectivePin = familyPin.trim() || getStoredFamilyPin();
+    if (!isHost || !room || room.status !== 'PLAYING' || !effectivePin) {
       return;
     }
 
@@ -89,11 +96,10 @@ export function useBotRunner({
       const diff = meta.botDifficulty === 'NONE' ? 'NORMAL' : meta.botDifficulty;
       const { minMs, maxMs } = BOT_DIFFICULTY_META[diff];
       const baseDelay = Math.floor(minMs + Math.random() * (maxMs - minMs));
-      // Slight stagger when multiple bots run simultaneously so moves feel natural
       const staggerMs = isFirstTurn ? Math.min(800, botIndex * 350) : 0;
       const delayMs = Math.min(maxMs, baseDelay + staggerMs);
 
-      // Prefetch AI word suggestion in parallel with the 4–8s wait timer (3s timeout)
+      // Prefetch AI word suggestion in parallel with the wait timer (3s timeout)
       const controller = new AbortController();
       abortControllers.push(controller);
 
@@ -102,7 +108,7 @@ export function useBotRunner({
           const snapshotBot = await getBotPlayerData(latestCheckRoom.code, botUid);
           if (!snapshotBot || snapshotBot.cards.length === 0 || cancelled) return [];
           return await generateBotWordsViaProxy({
-            pin: familyPin,
+            pin: effectivePin,
             theme: activeTheme,
             cards: snapshotBot.cards,
             usedWords: roomRef.current?.usedWords ?? latestCheckRoom.usedWords,
@@ -143,6 +149,89 @@ export function useBotRunner({
           return;
         }
 
+        // Respect Ice Block freeze on bot
+        const now = Date.now();
+        if (latestBot.blockedUntil && latestBot.blockedUntil > now) {
+          controller.abort();
+          const waitFreezeMs = Math.min(6200, latestBot.blockedUntil - now + 200);
+          const unfreezeId = window.setTimeout(() => {
+            scheduleBotMove(botUid, botIndex, false);
+          }, waitFreezeMs);
+          registerTimer(unfreezeId);
+          return;
+        }
+
+        // In CHAOS mode, ~25% chance to play a meaningful active action card before/alongside turn
+        if (
+          liveRoom.ruleVariant === 'CHAOS' &&
+          latestBot.actionCards.length > 0 &&
+          Math.random() < 0.25
+        ) {
+          const activeOpponents = liveRoom.playerOrder
+            .filter((uid) => uid !== botUid && !liveRoom.winnersOrder.includes(uid))
+            .map((uid) => liveRoom.playersMeta[uid])
+            .filter(Boolean)
+            .sort((a, b) => a.cardCount - b.cardCount);
+
+          const playableActions = shuffleArray(
+            latestBot.actionCards.filter((a): a is Exclude<ActionCardType, 'SHIELD'> => {
+              if (a === 'SHIELD') return false;
+              if (a === 'BLOCK_PLAYER') return activeOpponents.length > 0;
+              if (a === 'GIFT') return activeOpponents.length > 0 && latestBot.cards.length >= 2;
+              if (a === 'TIME_TURBO') return liveRoom.turnEndsAt - Date.now() > 7500;
+              return a === 'THEME_SWAP';
+            })
+          );
+
+          const chosenAction = playableActions[0];
+          if (chosenAction === 'BLOCK_PLAYER' && activeOpponents[0]) {
+            controller.abort();
+            await sendChaosBlock({
+              room: liveRoom,
+              sender: latestBot,
+              targetUid: activeOpponents[0].uid,
+              targetName: activeOpponents[0].name,
+            });
+            if (!cancelled && liveRoom.turnMode === 'SIMULTANEOUS') {
+              scheduleBotMove(botUid, botIndex, false);
+            }
+            return;
+          }
+          if (chosenAction === 'GIFT' && activeOpponents[0]) {
+            controller.abort();
+            // Prefer giving away a rare or regular non-Joker card
+            let giftCardIdx = latestBot.cards.findIndex((c) => isRareLetter(c));
+            if (giftCardIdx === -1) {
+              giftCardIdx = latestBot.cards.findIndex((c) => c !== 'JOKER');
+            }
+            if (giftCardIdx === -1) giftCardIdx = 0;
+            await sendChaosGift({
+              room: liveRoom,
+              sender: latestBot,
+              targetUid: activeOpponents[0].uid,
+              targetName: activeOpponents[0].name,
+              cardIndex: giftCardIdx,
+            });
+            if (!cancelled && liveRoom.turnMode === 'SIMULTANEOUS') {
+              scheduleBotMove(botUid, botIndex, false);
+            }
+            return;
+          }
+          if (chosenAction === 'TIME_TURBO') {
+            controller.abort();
+            await playChaosTimeTurbo(liveRoom, latestBot);
+            if (!cancelled && liveRoom.turnMode === 'SIMULTANEOUS') {
+              scheduleBotMove(botUid, botIndex, false);
+            }
+            return;
+          }
+          if (chosenAction === 'THEME_SWAP') {
+            controller.abort();
+            await playChaosThemeSwap(liveRoom, latestBot);
+            return;
+          }
+        }
+
         // Wait briefly at most 400ms for in-flight Gemini result, otherwise use local fallback immediately
         const aiSuggestions = await Promise.race([
           aiSuggestionsPromise,
@@ -172,33 +261,19 @@ export function useBotRunner({
         let chosenCardIndex = -1;
         let usedAi = false;
 
-        // 1. Try AI suggestion first (must match an unblocked hand letter and not be in usedWords)
+        // 1. Try AI suggestion first (supports Q/X/Y anywhere in word, Joker only as last resort)
         for (const candidate of aiSuggestions) {
           const norm =
             normalizeWord(stripGermanArticle(candidate.word)) ||
             normalizeWord(candidate.word);
           if (!norm || norm.length < 2 || usedSet.has(norm)) continue;
 
-          const startLetter = extractStartingLetter(
-            stripGermanArticle(candidate.word)
-          );
-          let cardIdx = latestBot.cards.findIndex((c) => c === startLetter);
-          let matchedLetter = startLetter;
-
-          if (cardIdx === -1 && candidate.letter) {
-            cardIdx = latestBot.cards.findIndex((c) => c === candidate.letter);
-            matchedLetter = candidate.letter;
-          }
-          if (cardIdx === -1) {
-            cardIdx = latestBot.cards.findIndex((c) => c === 'JOKER');
-            matchedLetter = 'JOKER';
-          }
-
-          if (cardIdx !== -1 && matchedLetter) {
+          const match = findBestMatchingCard(candidate.word, latestBot.cards, null);
+          if (match.matched) {
             chosenWord = candidate.word;
             chosenNormalized = norm;
-            chosenLetter = matchedLetter;
-            chosenCardIndex = cardIdx;
+            chosenLetter = match.matchedLetter;
+            chosenCardIndex = match.cardIndex;
             usedAi = true;
             break;
           }
@@ -248,7 +323,7 @@ export function useBotRunner({
         if (result.accepted) {
           onBotPlayedRef.current?.();
 
-          // Schedule next autonomous move in 4–8s if cards remain and round is still running
+          // Schedule next autonomous move if cards remain and round is still running
           if (
             !result.shouldEndRound &&
             latestBot.cards.length - 1 > 0 &&
@@ -257,7 +332,6 @@ export function useBotRunner({
             scheduleBotMove(botUid, botIndex, false);
           }
         } else if (freshRoom.turnMode === 'SIMULTANEOUS') {
-          // Word was sniped right before commit -> try again in 4–8s
           scheduleBotMove(botUid, botIndex, false);
         }
       }, delayMs);

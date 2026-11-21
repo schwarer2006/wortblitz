@@ -1,5 +1,6 @@
 import {
-  extractStartingLetter,
+  isRareLetter,
+  matchesLetterCard,
   normalizeWord,
   shuffleArray,
   stripGermanArticle,
@@ -162,6 +163,33 @@ const THEME_WORD_GROUPS: ThemeWordGroup[] = [
       Z: ['Zirkus', 'Zeichentrick', 'Ziel'],
     },
   },
+  {
+    keywords: ['panne', 'schief', 'peinlich', 'passiert', 'ärger', 'missgeschick', 'chaos', 'unfall', 'stress'],
+    wordsByLetter: {
+      A: ['Auto liegengeblieben', 'Alarm verschlafen'],
+      B: ['Badehose vergessen', 'Bus verpasst'],
+      D: ['Dusche kalt geblieben'],
+      E: ['Eis heruntergefallen'],
+      F: ['Flug verpasst', 'Fahrkarte verloren'],
+      G: ['Geldbeutel vergessen', 'Gepäck verschwunden'],
+      H: ['Handy im Pool', 'Haustür zugefallen'],
+      K: ['Koffer verloren', 'Kaffee verschüttet'],
+      L: ['Ladekabel vergessen', 'Luftmatratze geplatzt'],
+      M: ['Magen verdorben', 'Mütze weggeflogen'],
+      N: ['Navi ausgefallen'],
+      P: ['Pass abgelaufen', 'Platten am Fahrrad'],
+      Q: ['Quittung verloren', 'Aquaplaning gehabt'],
+      R: ['Reifen geplatzt', 'Regenschirm vergessen'],
+      S: ['Sonnenbrand geholt', 'Schlüssel verlegt'],
+      T: ['Taxi verpasst', 'Ticket vergessen'],
+      U: ['Uhr stehengeblieben'],
+      V: ['Verlaufen in der Altstadt'],
+      W: ['WLAN ausgefallen', 'Wecker überhört'],
+      X: ['Taxi verpasst', 'Extraportion verloren'],
+      Y: ['Handy ins Wasser gefallen'],
+      Z: ['Zug verpasst', 'Zelt undicht'],
+    },
+  },
 ];
 
 const GENERAL_GERMAN_WORDS: Record<string, string[]> = {
@@ -188,8 +216,8 @@ const GENERAL_GERMAN_WORDS: Record<string, string[]> = {
   U: ['Uhr', 'Urlaub', 'Ufer', 'Uhu', 'Umschlag', 'Untertasse', 'Unwetter'],
   V: ['Vogel', 'Vase', 'Vulkan', 'Violine', 'Vorhang', 'Vater', 'Velo'],
   W: ['Wasser', 'Wald', 'Wolke', 'Wagen', 'Wecker', 'Wiese', 'Wind', 'Welle'],
-  X: ['Xylofon', 'X-Beine', 'Xenon'],
-  Y: ['Yacht', 'Yak', 'Yoga', 'Ypsilon'],
+  X: ['Taxi', 'Xylofon', 'Mixer', 'Boxen', 'Hexerei'],
+  Y: ['Handy', 'Yacht', 'Yoga', 'Hobby', 'Baby'],
   Z: ['Zug', 'Zebra', 'Zitrone', 'Zelt', 'Zeit', 'Zange', 'Zucker', 'Zaun'],
 };
 
@@ -203,11 +231,7 @@ function isWordAvailable(
   const norm = normalizeWord(stripGermanArticle(word)) || normalizeWord(word);
   if (!norm || norm.length < 2) return false;
   if (usedSet.has(norm)) return false;
-
-  const start = extractStartingLetter(stripGermanArticle(word));
-  if (!start) return false;
-  if (expectedCardLetter === 'JOKER') return true;
-  return start === expectedCardLetter;
+  return matchesLetterCard(word, expectedCardLetter);
 }
 
 export function findLocalBotWord(params: {
@@ -226,14 +250,18 @@ export function findLocalBotWord(params: {
     group.keywords.some((kw) => themeLower.includes(kw))
   );
 
-  // Prefer regular letter cards first, then JOKER
-  const nonJokerLetters = shuffleArray(
-    Array.from(new Set(cards.filter((c) => c !== 'JOKER')))
+  // Priority: regular cards first, then rare Q/X/Y cards, then JOKER last
+  const regularLetters = shuffleArray(
+    Array.from(new Set(cards.filter((c) => c !== 'JOKER' && !isRareLetter(c))))
   );
+  const rareLetters = shuffleArray(
+    Array.from(new Set(cards.filter((c) => isRareLetter(c))))
+  );
+  const orderedNonJokerLetters = [...regularLetters, ...rareLetters];
   const hasJoker = cards.includes('JOKER');
 
-  // 1. Try thematic group words for regular cards
-  for (const letter of nonJokerLetters) {
+  // 1. Try thematic group words for regular & rare cards
+  for (const letter of orderedNonJokerLetters) {
     for (const group of matchingGroups) {
       const candidates = shuffleArray(group.wordsByLetter[letter] ?? []);
       const hit = candidates.find((w) => isWordAvailable(w, letter, usedSet));
@@ -243,12 +271,20 @@ export function findLocalBotWord(params: {
     }
   }
 
-  // 2. Try general German dictionary for regular cards
-  for (const letter of nonJokerLetters) {
+  // 2. Try general German dictionary for regular & rare cards
+  for (const letter of orderedNonJokerLetters) {
     const candidates = shuffleArray(GENERAL_GERMAN_WORDS[letter] ?? []);
     const hit = candidates.find((w) => isWordAvailable(w, letter, usedSet));
     if (hit) {
       return { word: hit, letter };
+    }
+    // For rare Q/X/Y cards, also scan across all general words if needed
+    if (isRareLetter(letter)) {
+      const allGeneral = shuffleArray(Object.values(GENERAL_GERMAN_WORDS).flat());
+      const rareHit = allGeneral.find((w) => isWordAvailable(w, letter, usedSet));
+      if (rareHit) {
+        return { word: rareHit, letter };
+      }
     }
   }
 
@@ -273,11 +309,11 @@ export function findLocalBotWord(params: {
     }
   }
 
-  // 4. Ultimate fallback if every single general word for a rare card was somehow used
-  const fallbackLetter = nonJokerLetters[0] ?? 'A';
+  // 4. Ultimate fallback
+  const fallbackLetter = orderedNonJokerLetters[0] ?? 'A';
   const fallbackPool = GENERAL_GERMAN_WORDS[fallbackLetter] ?? GENERAL_GERMAN_WORDS.A;
   return {
     word: fallbackPool[0],
-    letter: nonJokerLetters.length > 0 ? fallbackLetter : 'JOKER',
+    letter: orderedNonJokerLetters.length > 0 ? fallbackLetter : 'JOKER',
   };
 }

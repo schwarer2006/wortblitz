@@ -275,6 +275,24 @@ const EXPANDED_LETTER_DECK: string[] = LETTER_POOL.flatMap(({ letter, weight }) 
   Array.from({ length: weight }, () => letter)
 );
 
+export const RARE_LETTERS = ['Q', 'X', 'Y'] as const;
+
+export function isRareLetter(letter: string): boolean {
+  return (RARE_LETTERS as readonly string[]).includes(letter.toUpperCase());
+}
+
+const COMMON_SWAP_LETTERS = [
+  'E', 'N', 'S', 'R', 'A', 'T', 'M', 'K', 'L', 'B',
+  'G', 'H', 'W', 'F', 'P', 'Z', 'D', 'I', 'O', 'U',
+];
+
+export function drawEmergencySwapLetter(currentCards: string[]): string {
+  const handSet = new Set(currentCards);
+  const available = COMMON_SWAP_LETTERS.filter((l) => !handSet.has(l));
+  const pool = available.length > 0 ? available : COMMON_SWAP_LETTERS;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 export function drawSingleLetterCard(): string {
   const index = Math.floor(Math.random() * EXPANDED_LETTER_DECK.length);
   return EXPANDED_LETTER_DECK[index];
@@ -283,32 +301,41 @@ export function drawSingleLetterCard(): string {
 export function dealLetterHand(count: number): string[] {
   const hand: string[] = [];
   let jokerCount = 0;
+  let rareCount = 0;
   for (let i = 0; i < count; i++) {
     let card = drawSingleLetterCard();
-    if (card === 'JOKER') {
-      if (jokerCount >= 1) {
-        // Limit to max 1 Joker in starting hand to keep rounds fair
-        while (card === 'JOKER') {
-          card = drawSingleLetterCard();
-        }
-      } else {
-        jokerCount++;
-      }
+    let safety = 0;
+    while (
+      safety < 40 &&
+      ((card === 'JOKER' && jokerCount >= 1) || (isRareLetter(card) && rareCount >= 1))
+    ) {
+      card = drawSingleLetterCard();
+      safety++;
     }
+    if (card === 'JOKER' && jokerCount >= 1) {
+      card = COMMON_SWAP_LETTERS[Math.floor(Math.random() * COMMON_SWAP_LETTERS.length)];
+    }
+    if (isRareLetter(card) && rareCount >= 1) {
+      card = COMMON_SWAP_LETTERS[Math.floor(Math.random() * COMMON_SWAP_LETTERS.length)];
+    }
+
+    if (card === 'JOKER') jokerCount++;
+    if (isRareLetter(card)) rareCount++;
     hand.push(card);
   }
   return hand;
 }
 
-const ACTION_POOL: ActionCardType[] = ['THEME_SWAP', 'GIFT', 'TIME_TURBO', 'SHIELD'];
+const ACTION_POOL: ActionCardType[] = [
+  'THEME_SWAP',
+  'GIFT',
+  'TIME_TURBO',
+  'SHIELD',
+  'BLOCK_PLAYER',
+];
 
 export function dealActionCards(count: number): ActionCardType[] {
-  const result: ActionCardType[] = [];
-  for (let i = 0; i < count; i++) {
-    const idx = Math.floor(Math.random() * ACTION_POOL.length);
-    result.push(ACTION_POOL[idx]);
-  }
-  return result;
+  return shuffleArray(ACTION_POOL).slice(0, Math.min(count, ACTION_POOL.length));
 }
 
 export const ACTION_CARD_META: Record<
@@ -336,8 +363,14 @@ export const ACTION_CARD_META: Record<
   SHIELD: {
     emoji: '🛡️',
     title: 'Schutzschild',
-    shortDesc: 'Wehrt Karten-Geschenk oder Strafkarte ab',
+    shortDesc: 'Wehrt Geschenk, Eisblock oder Strafkarte ab',
     colorClass: 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200',
+  },
+  BLOCK_PLAYER: {
+    emoji: '❄️',
+    title: 'Eisblock',
+    shortDesc: 'Friert einen Mitspieler für 6 Sekunden ein',
+    colorClass: 'bg-cyan-500/20 border-cyan-400/50 text-cyan-100',
   },
 };
 
@@ -432,6 +465,103 @@ export function extractStartingLetter(word: string): string {
   if (first === 'Ü') return 'U';
   if (first === 'ß') return 'S';
   return /^[A-Z]$/.test(first) ? first : '';
+}
+
+export function textContainsRareLetter(input: string, rareLetter: string): boolean {
+  const upper = normalizeWord(input).toUpperCase();
+  return upper.includes(rareLetter.toUpperCase());
+}
+
+export function matchesLetterCard(input: string, cardLetter: string): boolean {
+  const normalized = normalizeWord(input);
+  if (!normalized) return false;
+
+  if (cardLetter === 'JOKER') {
+    const stripped = stripGermanArticle(normalized);
+    return Boolean(extractStartingLetter(stripped) || extractStartingLetter(normalized));
+  }
+
+  if (isRareLetter(cardLetter)) {
+    return textContainsRareLetter(normalized, cardLetter);
+  }
+
+  const stripped = stripGermanArticle(normalized);
+  const startLetter = extractStartingLetter(stripped || normalized);
+  return startLetter === cardLetter;
+}
+
+export type CardMatchResult =
+  | { matched: true; cardIndex: number; matchedLetter: string }
+  | {
+      matched: false;
+      reason: 'WRONG_SELECTED_LETTER' | 'NO_MATCHING_CARD';
+      expectedLetter: string;
+    };
+
+export function findBestMatchingCard(
+  input: string,
+  cards: string[],
+  selectedIndex: number | null
+): CardMatchResult {
+  if (selectedIndex !== null && cards[selectedIndex]) {
+    const selectedLetter = cards[selectedIndex];
+    if (matchesLetterCard(input, selectedLetter)) {
+      return {
+        matched: true,
+        cardIndex: selectedIndex,
+        matchedLetter: selectedLetter,
+      };
+    }
+    return {
+      matched: false,
+      reason: 'WRONG_SELECTED_LETTER',
+      expectedLetter: selectedLetter,
+    };
+  }
+
+  // Priority 1: Regular starting-letter cards (not Q/X/Y, not JOKER)
+  const stripped = stripGermanArticle(normalizeWord(input));
+  const startLetter = extractStartingLetter(stripped || normalizeWord(input));
+  if (startLetter) {
+    const regularIdx = cards.findIndex(
+      (c) => c !== 'JOKER' && !isRareLetter(c) && c === startLetter
+    );
+    if (regularIdx !== -1) {
+      return {
+        matched: true,
+        cardIndex: regularIdx,
+        matchedLetter: cards[regularIdx],
+      };
+    }
+  }
+
+  // Priority 2: Rare letters (Q, X, Y) occurring anywhere inside any word of the phrase
+  const rareIdx = cards.findIndex(
+    (c) => isRareLetter(c) && textContainsRareLetter(input, c)
+  );
+  if (rareIdx !== -1) {
+    return {
+      matched: true,
+      cardIndex: rareIdx,
+      matchedLetter: cards[rareIdx],
+    };
+  }
+
+  // Priority 3: JOKER only when no regular or rare letter card matched
+  const jokerIdx = cards.findIndex((c) => c === 'JOKER');
+  if (jokerIdx !== -1 && startLetter) {
+    return {
+      matched: true,
+      cardIndex: jokerIdx,
+      matchedLetter: 'JOKER',
+    };
+  }
+
+  return {
+    matched: false,
+    reason: 'NO_MATCHING_CARD',
+    expectedLetter: startLetter || '?',
+  };
 }
 
 export function calculateRoundPoints(rankIndex: number, totalPlayers: number): number {

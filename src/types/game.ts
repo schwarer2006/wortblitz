@@ -4,7 +4,12 @@ export type TurnMode = 'SIMULTANEOUS' | 'TURN_BASED';
 
 export type RuleVariant = 'CLASSIC' | 'CHAOS';
 
-export type ActionCardType = 'THEME_SWAP' | 'GIFT' | 'TIME_TURBO' | 'SHIELD';
+export type ActionCardType =
+  | 'THEME_SWAP'
+  | 'GIFT'
+  | 'TIME_TURBO'
+  | 'SHIELD'
+  | 'BLOCK_PLAYER';
 
 export type BotDifficulty = 'NONE' | 'SLOW' | 'NORMAL' | 'FAST';
 
@@ -71,6 +76,8 @@ export interface PlayerData {
   finishedRound: number;
   lastScoredRound: number;
   secretThemeCount: number;
+  blockedUntil?: number;
+  swappedRound?: number;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -101,7 +108,7 @@ export interface FeedEntry {
 
 export interface ChaosEvent {
   id: string;
-  type: 'GIFT';
+  type: 'GIFT' | 'BLOCK';
   fromUid: string;
   fromName: string;
   toUid: string;

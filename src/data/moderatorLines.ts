@@ -119,3 +119,44 @@ export function pickTimeTurboLine(playerName: string): string {
     `Tempo! ${playerName} zündet den Zeit-Turbo!`,
   ]);
 }
+
+export function pickIceBlockLine(senderName: string, targetName: string): string {
+  return pickRandom([
+    `Eisblock! ${senderName} friert ${targetName} für sechs Sekunden ein!`,
+    `Brrr, kalt erwischt! ${targetName} sitzt im Eisblock fest!`,
+  ]);
+}
+
+export function pickJokerPlayedLine(playerName: string): string {
+  return pickRandom([
+    `Joker gezündet! ${playerName} räumt clever ab!`,
+    `Stark gespielt – ${playerName} legt den goldenen Joker!`,
+  ]);
+}
+
+export function pickRareLetterWordLine(
+  playerName: string,
+  letter: string
+): string {
+  return pickRandom([
+    `Seltener Buchstabe ${letter} geknackt! Stark gemacht, ${playerName}!`,
+    `Wow! ${playerName} bringt sogar ein ${letter} unter!`,
+  ]);
+}
+
+export function pickWrongLetterLine(
+  playerName: string,
+  word: string,
+  expectedLetter?: string
+): string {
+  if (expectedLetter && expectedLetter !== '?') {
+    return pickRandom([
+      `Oh nein, ${playerName}! ${word} passt nicht zu ${expectedLetter} – ein Strafpunkt!`,
+      `Daneben! Für ${expectedLetter} zählt ${word} leider nicht – minus eins!`,
+    ]);
+  }
+  return pickRandom([
+    `Oje, ${playerName}! Zu ${word} fehlt die passende Karte – minus eins!`,
+    `Schade! Keine passende Handkarte für ${word} – ein Strafpunkt!`,
+  ]);
+}

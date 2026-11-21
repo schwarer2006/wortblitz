@@ -74,7 +74,7 @@ service cloud.firestore {
         && data.activeTurnUid is string && data.activeTurnUid.size() <= 128
         && isStringList(data.playerOrder, 8, 128)
         && data.playersMeta is map && data.playersMeta.keys().size() <= 8
-        && isStringList(data.usedWords, 100, 64)
+        && isStringList(data.usedWords, 100, 100)
         && isStringList(data.winnersOrder, 8, 128)
         && data.lastActionNotice is string && data.lastActionNotice.size() <= 160
         && (!('latestAnnouncement' in data) || isValidAnnouncement(data.latestAnnouncement))
@@ -94,6 +94,7 @@ service cloud.firestore {
           'uid', 'name', 'avatar', 'isJunior', 'isBot', 'botDifficulty',
           'cards', 'cardCount', 'actionCards', 'score', 'roundDealt',
           'finishedRound', 'lastScoredRound', 'secretThemeCount',
+          'blockedUntil', 'swappedRound',
           'createdAt', 'updatedAt'
         ])
         && data.uid is string && data.uid == playerId && isValidId(data.uid)
@@ -105,11 +106,13 @@ service cloud.firestore {
         && isStringList(data.cards, 25, 10)
         && data.cardCount is int && data.cardCount >= 0 && data.cardCount <= 25
         && isStringList(data.actionCards, 4, 24)
-        && data.score is int && data.score >= 0 && data.score <= 200
+        && data.score is int && data.score >= -50 && data.score <= 200
         && data.roundDealt is int && data.roundDealt >= 0 && data.roundDealt <= 100
         && data.finishedRound is int && data.finishedRound >= 0 && data.finishedRound <= 100
         && data.lastScoredRound is int && data.lastScoredRound >= 0 && data.lastScoredRound <= 100
         && data.secretThemeCount is int && data.secretThemeCount >= 0 && data.secretThemeCount <= 2
+        && (!('blockedUntil' in data) || (data.blockedUntil is number && data.blockedUntil >= 0))
+        && (!('swappedRound' in data) || (data.swappedRound is int && data.swappedRound >= 0 && data.swappedRound <= 100))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -135,7 +138,7 @@ service cloud.firestore {
         && isValidId(data.uid)
         && data.playerName is string && data.playerName.size() >= 1 && data.playerName.size() <= 24
         && data.avatar is string && data.avatar.size() >= 1 && data.avatar.size() <= 24
-        && data.word is string && data.word.size() >= 1 && data.word.size() <= 64
+        && data.word is string && data.word.size() >= 1 && data.word.size() <= 100
         && data.letter is string && data.letter.size() >= 1 && data.letter.size() <= 10
         && data.theme is string && data.theme.size() >= 1 && data.theme.size() <= 120
         && data.roundNumber is int && data.roundNumber >= 1 && data.roundNumber <= 100
@@ -153,7 +156,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'type', 'fromUid', 'fromName', 'toUid', 'letter', 'status', 'createdAt', 'updatedAt'
         ])
-        && data.type == 'GIFT'
+        && data.type in ['GIFT', 'BLOCK']
         && isValidId(data.fromUid)
         && data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 24
         && isValidId(data.toUid) && data.toUid != data.fromUid

@@ -8,23 +8,26 @@ import {
   Megaphone,
   Mic,
   MicOff,
+  RefreshCw,
   RotateCcw,
   Send,
   Shield,
+  Snowflake,
   Volume2,
   VolumeX,
   XCircle,
 } from 'lucide-react';
 import {
   ACTION_CARD_META,
-  extractStartingLetter,
+  findBestMatchingCard,
   getAvatar,
   getLetterCardColors,
+  isRareLetter,
   normalizeWord,
   stripGermanArticle,
 } from '../data/themesAndCards';
 import { useSpeechRecognition, type MicMode } from '../hooks/useSpeechRecognition';
-import { judgeWordViaProxy } from '../lib/geminiProxy';
+import { getStoredFamilyPin, judgeWordViaProxy } from '../lib/geminiProxy';
 import {
   playActionSound,
   playCardTap,
@@ -68,13 +71,23 @@ interface GameViewProps {
     word: string;
     reason: string;
     penaltyApplied: boolean;
+    wrongLetter?: boolean;
+    expectedLetter?: string;
   }) => Promise<{ feedId: string; penaltyCard: string | null }>;
+  onSwapCard: (
+    cardIndex: number
+  ) => Promise<
+    | { ok: true; oldLetter: string; newLetter: string }
+    | { ok: false; reason: string }
+  >;
   onUndoEntry: (entry: FeedEntry, normalizedWord: string) => Promise<void>;
   onConsumeShieldForPenalty: () => Promise<void>;
   onPlayThemeSwap: () => Promise<void>;
   onPlayTimeTurbo: () => Promise<void>;
   onSendGift: (targetUid: string, targetName: string, cardIndex: number) => Promise<void>;
   onResolveGift: (event: ChaosEvent, useShield: boolean) => Promise<void>;
+  onSendBlock: (targetUid: string, targetName: string) => Promise<void>;
+  onResolveBlock: (event: ChaosEvent, useShield: boolean) => Promise<void>;
   onFinishRoundManually: () => Promise<void>;
   onLogout: () => void;
 }
@@ -85,6 +98,17 @@ interface JudgeFeedback {
   reason: string;
   canShieldPenalty?: boolean;
 }
+
+type ChaosTargetMode =
+  | {
+      type: 'GIFT';
+      step: 'PICK_CARD' | 'PICK_TARGET';
+      cardIndex: number | null;
+    }
+  | {
+      type: 'BLOCK';
+    }
+  | null;
 
 export const GameView: React.FC<GameViewProps> = ({
   room,
@@ -102,12 +126,15 @@ export const GameView: React.FC<GameViewProps> = ({
   onTurnTimedOut,
   onAcceptWord,
   onRejectWord,
+  onSwapCard,
   onUndoEntry,
   onConsumeShieldForPenalty,
   onPlayThemeSwap,
   onPlayTimeTurbo,
   onSendGift,
   onResolveGift,
+  onSendBlock,
+  onResolveBlock,
   onFinishRoundManually,
   onLogout,
 }) => {
@@ -122,18 +149,20 @@ export const GameView: React.FC<GameViewProps> = ({
   // Push-to-Talk is default for noisy rounds
   const [micMode, setMicMode] = useState<MicMode>('PUSH_TO_TALK');
   const [manualInput, setManualInput] = useState('');
+  const [selectedCardIndex, setSelectedCardIndex] = useState<number | null>(null);
+  const [swappingCard, setSwappingCard] = useState(false);
   const [feedback, setFeedback] = useState<JudgeFeedback | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [countdownStep, setCountdownStep] = useState<number>(3);
-  const [giftMode, setGiftMode] = useState<{
-    step: 'PICK_CARD' | 'PICK_TARGET';
-    cardIndex: number | null;
-  } | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [chaosTargetMode, setChaosTargetMode] = useState<ChaosTargetMode>(null);
   const [pendingPenaltyState, setPendingPenaltyState] = useState<{
     word: string;
     reason: string;
   } | null>(null);
 
+  const manualInputRef = useRef<HTMLInputElement | null>(null);
+  const autoHandledBlocksRef = useRef<Set<string>>(new Set());
   const timerHandledKeyRef = useRef<string>('');
   const isCheckingRef = useRef(false);
 
@@ -232,30 +261,84 @@ export const GameView: React.FC<GameViewProps> = ({
     };
   }, [room.status, room.turnEndsAt, room.roundNumber, room.currentThemeIndex]);
 
-  const findMatchingCard = useCallback(
-    (word: string): { cardIndex: number; matchedLetter: string } | null => {
-      const stripped = stripGermanArticle(normalizeWord(word));
-      const candidates = [
-        extractStartingLetter(stripped),
-        extractStartingLetter(word),
-      ].filter(Boolean);
+  // Live Ice Block countdown tick
+  const blockedUntilMs = myPlayer.blockedUntil ?? 0;
+  const isFrozen = blockedUntilMs > nowMs;
+  const iceSecondsLeft = isFrozen
+    ? Math.max(1, Math.ceil((blockedUntilMs - nowMs) / 1000))
+    : 0;
 
-      for (const letter of candidates) {
-        const exactIdx = myPlayer.cards.findIndex((c) => c === letter);
-        if (exactIdx !== -1) {
-          return { cardIndex: exactIdx, matchedLetter: letter };
-        }
+  useEffect(() => {
+    setNowMs(Date.now());
+    if (blockedUntilMs <= Date.now()) return;
+    const id = window.setInterval(() => {
+      const current = Date.now();
+      setNowMs(current);
+      if (current >= blockedUntilMs) {
+        window.clearInterval(id);
       }
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [blockedUntilMs]);
 
-      const jokerIdx = myPlayer.cards.findIndex((c) => c === 'JOKER');
-      if (jokerIdx !== -1) {
-        return { cardIndex: jokerIdx, matchedLetter: 'JOKER' };
-      }
+  // Keep selectedCardIndex valid when hand changes or round changes
+  useEffect(() => {
+    if (
+      selectedCardIndex !== null &&
+      selectedCardIndex >= myPlayer.cards.length
+    ) {
+      setSelectedCardIndex(null);
+    }
+  }, [myPlayer.cards.length, selectedCardIndex]);
 
-      return null;
-    },
-    [myPlayer.cards]
+  useEffect(() => {
+    setSelectedCardIndex(null);
+  }, [room.roundNumber]);
+
+  const pendingGiftEvents = useMemo(
+    () => pendingGifts.filter((e) => e.type === 'GIFT'),
+    [pendingGifts]
   );
+  const pendingBlockEvents = useMemo(
+    () => pendingGifts.filter((e) => e.type === 'BLOCK'),
+    [pendingGifts]
+  );
+
+  // If incoming BLOCK arrives and player has NO Shield, freeze immediately without waiting for click
+  useEffect(() => {
+    const incomingBlock = pendingBlockEvents[0];
+    if (!incomingBlock) return;
+    if (myPlayer.actionCards.includes('SHIELD')) return;
+    if (autoHandledBlocksRef.current.has(incomingBlock.id)) return;
+    autoHandledBlocksRef.current.add(incomingBlock.id);
+    playErrorBuzz(effectiveMuted);
+    onResolveBlock(incomingBlock, false);
+  }, [pendingBlockEvents, myPlayer.actionCards, effectiveMuted, onResolveBlock]);
+
+  const selectedLetter =
+    selectedCardIndex !== null ? (myPlayer.cards[selectedCardIndex] ?? null) : null;
+  const canUseEmergencySwap =
+    room.status === 'PLAYING' &&
+    room.turnEndsAt > 0 &&
+    !isFrozen &&
+    selectedCardIndex !== null &&
+    (myPlayer.swappedRound ?? 0) < room.roundNumber;
+
+  const inputPlaceholder = useMemo(() => {
+    if (isFrozen) {
+      return `❄️ Eingefroren (${iceSecondsLeft}s)…`;
+    }
+    if (selectedLetter) {
+      if (selectedLetter === 'JOKER') {
+        return `Beliebiges Wort oder Satz (A–Z) zu ${room.currentTheme}...`;
+      }
+      if (isRareLetter(selectedLetter)) {
+        return `Wort oder Satz mit ${selectedLetter} im Wort...`;
+      }
+      return `Wort oder Satz mit ${selectedLetter} zu ${room.currentTheme}...`;
+    }
+    return 'Wort oder Satz sprechen / eintippen…';
+  }, [isFrozen, iceSecondsLeft, selectedLetter, room.currentTheme]);
 
   const handleSubmitSpokenWord = useCallback(
     async (rawSpoken: string) => {
@@ -264,6 +347,7 @@ export const GameView: React.FC<GameViewProps> = ({
         room.turnEndsAt === 0 ||
         hasFinishedHand ||
         !isMyTurn ||
+        isFrozen ||
         isCheckingRef.current
       ) {
         return;
@@ -275,31 +359,47 @@ export const GameView: React.FC<GameViewProps> = ({
         normalizeWord(stripGermanArticle(cleaned)) || normalizeWord(cleaned);
       if (!normalized || normalized.length < 2) return;
 
-      // Stage 1: Letter Check
-      const match = findMatchingCard(cleaned);
-      if (!match) {
-        const needed = extractStartingLetter(stripGermanArticle(cleaned)) || '?';
+      // Stage 1: Letter / Card Check (wrong letter => immediate -1 Strafpunkt!)
+      const match = findBestMatchingCard(
+        cleaned,
+        myPlayer.cards,
+        selectedCardIndex
+      );
+      if (!match.matched) {
         playErrorBuzz(effectiveMuted);
+        const wrongMsg =
+          match.reason === 'WRONG_SELECTED_LETTER'
+            ? `"${cleaned}" passt nicht zu Karte ${match.expectedLetter} (-1 Strafpunkt)`
+            : `"${cleaned}" passt zu keiner Karte auf deiner Hand (-1 Strafpunkt)`;
+
         setFeedback({
           type: 'INVALID',
           word: cleaned,
-          reason: `Keine Karte mit "${needed}" (und kein Joker) auf der Hand.`,
+          reason: wrongMsg,
+        });
+
+        await onRejectWord({
+          word: cleaned,
+          reason: wrongMsg,
+          penaltyApplied: false,
+          wrongLetter: true,
+          expectedLetter: match.expectedLetter,
         });
         return;
       }
 
-      // Stage 2: Duplicate Check
+      // Stage 2: Duplicate Check (no penalty point on simultaneous collision)
       if (room.usedWords.includes(normalized)) {
         playErrorBuzz(effectiveMuted);
         setFeedback({
-          type: 'INVALID',
+          type: 'INFO',
           word: cleaned,
           reason: `"${cleaned}" wurde bei diesem Thema schon genannt!`,
         });
         return;
       }
 
-      // Stage 3: Gemini Referee via ./gemini.php (No points or card changes before validation succeeds!)
+      // Stage 3: Strict Gemini Referee via ./gemini.php
       isCheckingRef.current = true;
       setFeedback({
         type: 'CHECKING',
@@ -308,15 +408,18 @@ export const GameView: React.FC<GameViewProps> = ({
       });
 
       try {
+        const effectivePin = familyPin.trim() || getStoredFamilyPin();
         const result = await judgeWordViaProxy({
-          pin: familyPin,
+          pin: effectivePin,
           word: cleaned,
           theme: room.currentTheme,
           isJunior: myPlayer.isJunior,
+          matchedLetter: match.matchedLetter,
+          isRareLetterMode: isRareLetter(match.matchedLetter),
         });
 
         if (!result.ok) {
-          // Technical API failure: catch cleanly without showing raw API error in red banner or penalizing
+          console.error('KI-Wortprüfung abgebrochen/fehlgeschlagen:', result.reason);
           setFeedback({
             type: 'INFO',
             word: cleaned,
@@ -336,6 +439,7 @@ export const GameView: React.FC<GameViewProps> = ({
 
           if (acceptRes.accepted) {
             playSuccessChime(effectiveMuted);
+            setSelectedCardIndex(null);
             setFeedback({
               type: 'VALID',
               word: cleaned,
@@ -355,7 +459,7 @@ export const GameView: React.FC<GameViewProps> = ({
             setFeedback({
               type: 'INVALID',
               word: cleaned,
-              reason: result.reason,
+              reason: `${result.reason} (-1 Strafpunkt)`,
               canShieldPenalty: true,
             });
           } else {
@@ -368,17 +472,20 @@ export const GameView: React.FC<GameViewProps> = ({
               type: 'INVALID',
               word: cleaned,
               reason: rejected.penaltyCard
-                ? `${result.reason} (+1 Strafkarte ${rejected.penaltyCard})`
-                : result.reason,
+                ? `${result.reason} (-1 Strafpunkt & +1 Strafkarte ${rejected.penaltyCard} gezogen!)`
+                : `${result.reason} (-1 Strafpunkt)`,
             });
           }
         }
-      } catch {
-        // Fallback safety guard: never display raw error messages in the red hint banner
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error('Unerwarteter Fehler bei Wortprüfung:', errMsg, err);
         setFeedback({
           type: 'INFO',
           word: cleaned,
-          reason: 'Prüfung gerade nicht möglich – bitte erneut versuchen.',
+          reason: errMsg.trim()
+            ? `Technischer Fehler (${errMsg.trim()}) – bitte erneut versuchen.`
+            : 'Prüfung gerade nicht möglich – bitte erneut versuchen.',
         });
       } finally {
         isCheckingRef.current = false;
@@ -393,9 +500,11 @@ export const GameView: React.FC<GameViewProps> = ({
       familyPin,
       hasFinishedHand,
       isMyTurn,
+      isFrozen,
+      myPlayer.cards,
       myPlayer.isJunior,
       myPlayer.actionCards,
-      findMatchingCard,
+      selectedCardIndex,
       effectiveMuted,
       onAcceptWord,
       onRejectWord,
@@ -407,6 +516,7 @@ export const GameView: React.FC<GameViewProps> = ({
     room.turnEndsAt > 0 &&
     !hasFinishedHand &&
     isMyTurn &&
+    !isFrozen &&
     !pendingPenaltyState;
 
   const {
@@ -425,58 +535,75 @@ export const GameView: React.FC<GameViewProps> = ({
   const handleManualTextSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const val = manualInput.trim();
-    if (!val) return;
+    if (!val || isFrozen) return;
     setManualInput('');
     await handleSubmitSpokenWord(val);
   };
 
-  const handleTapLetterCard = async (cardIndex: number, letter: string) => {
+  const handleTapLetterCard = (cardIndex: number) => {
     if (
       room.status !== 'PLAYING' ||
       room.turnEndsAt === 0 ||
       hasFinishedHand ||
+      isFrozen ||
       isCheckingRef.current
     ) {
       return;
     }
 
-    if (giftMode?.step === 'PICK_CARD') {
-      setGiftMode({ step: 'PICK_TARGET', cardIndex });
+    if (chaosTargetMode?.type === 'GIFT' && chaosTargetMode.step === 'PICK_CARD') {
+      playCardTap(effectiveMuted);
+      setChaosTargetMode({ type: 'GIFT', step: 'PICK_TARGET', cardIndex });
       return;
     }
 
     if (!isMyTurn) return;
 
-    const tag = Date.now().toString().slice(-4);
-    const label = letter === 'JOKER' ? `Joker ${tag}` : `Karte ${letter} ${tag}`;
-    const normalized = normalizeWord(stripGermanArticle(label));
-
-    const acceptRes = await onAcceptWord({
-      word: label,
-      normalizedWord: normalized,
-      matchedLetter: letter,
-      cardIndex,
-      reason: 'Per Fingertipp abgelegt',
+    playCardTap(effectiveMuted);
+    setSelectedCardIndex((prev) => {
+      const next = prev === cardIndex ? null : cardIndex;
+      if (next !== null) {
+        window.setTimeout(() => {
+          manualInputRef.current?.focus();
+        }, 20);
+      }
+      return next;
     });
+  };
 
-    if (acceptRes.accepted) {
-      playCardTap(effectiveMuted);
-      setFeedback({
-        type: 'VALID',
-        word: letter === 'JOKER' ? '★ Joker' : `Karte ${letter}`,
-        reason: 'Per Fingertipp abgelegt! (+1 Punkt)',
-      });
-    } else {
-      setFeedback({
-        type: 'INFO',
-        word: letter === 'JOKER' ? '★ Joker' : `Karte ${letter}`,
-        reason: acceptRes.reason,
-      });
+  const handleEmergencySwapClick = async () => {
+    if (
+      selectedCardIndex === null ||
+      swappingCard ||
+      !canUseEmergencySwap
+    ) {
+      return;
+    }
+    setSwappingCard(true);
+    try {
+      const res = await onSwapCard(selectedCardIndex);
+      if (res.ok) {
+        playActionSound(effectiveMuted);
+        setSelectedCardIndex(null);
+        setFeedback({
+          type: 'INFO',
+          word: 'Notfall-Tausch',
+          reason: `Karte ${res.oldLetter} gegen ${res.newLetter} getauscht!`,
+        });
+      } else {
+        setFeedback({
+          type: 'INFO',
+          word: 'Notfall-Tausch',
+          reason: res.reason,
+        });
+      }
+    } finally {
+      setSwappingCard(false);
     }
   };
 
   const handleActionCardClick = async (action: ActionCardType) => {
-    if (room.status !== 'PLAYING') return;
+    if (room.status !== 'PLAYING' || isFrozen) return;
     if (action === 'THEME_SWAP') {
       playActionSound(effectiveMuted);
       await onPlayThemeSwap();
@@ -485,7 +612,10 @@ export const GameView: React.FC<GameViewProps> = ({
       await onPlayTimeTurbo();
     } else if (action === 'GIFT') {
       if (myPlayer.cards.length === 0) return;
-      setGiftMode({ step: 'PICK_CARD', cardIndex: null });
+      setChaosTargetMode({ type: 'GIFT', step: 'PICK_CARD', cardIndex: null });
+    } else if (action === 'BLOCK_PLAYER') {
+      if (otherActivePlayers.length === 0) return;
+      setChaosTargetMode({ type: 'BLOCK' });
     }
   };
 
@@ -727,15 +857,53 @@ export const GameView: React.FC<GameViewProps> = ({
           </div>
         </section>
 
+        {/* Incoming Ice Block (only visible when player holds SHIELD) */}
+        {pendingBlockEvents.length > 0 && myPlayer.actionCards.includes('SHIELD') && (
+          <div className="rounded-2xl bg-cyan-500/15 border border-cyan-400/50 p-3.5 flex items-center justify-between gap-3 animate-card-pop">
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-white flex items-center gap-1.5">
+                <Snowflake className="w-4 h-4 text-cyan-300 shrink-0" />
+                <span>Eisblock von {pendingBlockEvents[0].fromName}!</span>
+              </div>
+              <div className="text-xs text-cyan-100">
+                Friert dich 6 Sekunden ein – mit Schutzschild abwehren?
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  playActionSound(effectiveMuted);
+                  onResolveBlock(pendingBlockEvents[0], true);
+                }}
+                className="min-h-[40px] px-3 rounded-xl bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1"
+              >
+                <Shield className="w-3.5 h-3.5" />
+                <span>Abwehren</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  playErrorBuzz(effectiveMuted);
+                  onResolveBlock(pendingBlockEvents[0], false);
+                }}
+                className="min-h-[40px] px-3 rounded-xl bg-white/15 text-white text-xs font-semibold"
+              >
+                Annehmen
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Incoming Gift */}
-        {pendingGifts.length > 0 && (
+        {pendingGiftEvents.length > 0 && (
           <div className="rounded-2xl bg-rose-500/15 border border-rose-400/40 p-3.5 flex items-center justify-between gap-3 animate-card-pop">
             <div className="min-w-0">
               <div className="text-sm font-bold text-white">
-                🎁 Karten-Geschenk von {pendingGifts[0].fromName}!
+                🎁 Karten-Geschenk von {pendingGiftEvents[0].fromName}!
               </div>
               <div className="text-xs text-rose-200">
-                Karte &bdquo;{pendingGifts[0].letter}&ldquo; wartet auf dich.
+                Karte &bdquo;{pendingGiftEvents[0].letter}&ldquo; wartet auf dich.
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -744,7 +912,7 @@ export const GameView: React.FC<GameViewProps> = ({
                   type="button"
                   onClick={() => {
                     playActionSound(effectiveMuted);
-                    onResolveGift(pendingGifts[0], true);
+                    onResolveGift(pendingGiftEvents[0], true);
                   }}
                   className="min-h-[40px] px-3 rounded-xl bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1"
                 >
@@ -754,7 +922,7 @@ export const GameView: React.FC<GameViewProps> = ({
               )}
               <button
                 type="button"
-                onClick={() => onResolveGift(pendingGifts[0], false)}
+                onClick={() => onResolveGift(pendingGiftEvents[0], false)}
                 className="min-h-[40px] px-3 rounded-xl bg-white/15 text-white text-xs font-semibold"
               >
                 Annehmen
@@ -778,13 +946,19 @@ export const GameView: React.FC<GameViewProps> = ({
               <button
                 type="button"
                 onClick={async () => {
+                  const p = pendingPenaltyState;
                   playActionSound(effectiveMuted);
                   await onConsumeShieldForPenalty();
+                  await onRejectWord({
+                    word: p.word,
+                    reason: `${p.reason} (Strafkarte mit Schutzschild abgewehrt)`,
+                    penaltyApplied: false,
+                  });
                   setPendingPenaltyState(null);
                   setFeedback({
-                    type: 'VALID',
-                    word: pendingPenaltyState.word,
-                    reason: 'Strafkarte mit Schutzschild abgewehrt!',
+                    type: 'INVALID',
+                    word: p.word,
+                    reason: `${p.reason} (-1 Strafpunkt, Strafkarte mit Schutzschild abgewehrt!)`,
                   });
                 }}
                 className="min-h-[40px] px-3 rounded-xl bg-emerald-400 text-slate-950 text-xs font-bold"
@@ -796,10 +970,17 @@ export const GameView: React.FC<GameViewProps> = ({
                 onClick={async () => {
                   const p = pendingPenaltyState;
                   setPendingPenaltyState(null);
-                  await onRejectWord({
+                  const rejected = await onRejectWord({
                     word: p.word,
                     reason: p.reason,
                     penaltyApplied: true,
+                  });
+                  setFeedback({
+                    type: 'INVALID',
+                    word: p.word,
+                    reason: rejected.penaltyCard
+                      ? `${p.reason} (-1 Strafpunkt & +1 Strafkarte ${rejected.penaltyCard} gezogen!)`
+                      : `${p.reason} (-1 Strafpunkt)`,
                   });
                 }}
                 className="min-h-[40px] px-3 rounded-xl bg-white/10 text-white text-xs font-semibold"
@@ -841,36 +1022,55 @@ export const GameView: React.FC<GameViewProps> = ({
           </div>
         )}
 
-        {/* Chaos Gift Picker */}
-        {giftMode && (
-          <div className="rounded-2xl bg-[#1C202E] border border-rose-400/50 p-4 space-y-3">
+        {/* Chaos Gift or Ice Block Target Picker */}
+        {chaosTargetMode && (
+          <div
+            className={`rounded-2xl bg-[#1C202E] border p-4 space-y-3 ${
+              chaosTargetMode.type === 'BLOCK'
+                ? 'border-cyan-400/50'
+                : 'border-rose-400/50'
+            }`}
+          >
             <div className="flex items-center justify-between">
               <span className="text-sm font-bold text-white">
-                {giftMode.step === 'PICK_CARD'
-                  ? '🎁 Schritt 1: Tippe unten eine deiner Buchstabenkarten an'
-                  : '🎁 Schritt 2: Wem möchtest du die Karte schenken?'}
+                {chaosTargetMode.type === 'BLOCK'
+                  ? '❄️ Wen möchtest du für 6 Sekunden einfrieren?'
+                  : chaosTargetMode.step === 'PICK_CARD'
+                    ? '🎁 Schritt 1: Tippe unten eine deiner Buchstabenkarten an'
+                    : '🎁 Schritt 2: Wem möchtest du die Karte schenken?'}
               </span>
               <button
                 type="button"
-                onClick={() => setGiftMode(null)}
+                onClick={() => setChaosTargetMode(null)}
                 className="text-xs text-slate-400 hover:text-white"
               >
                 Abbrechen
               </button>
             </div>
-            {giftMode.step === 'PICK_TARGET' && giftMode.cardIndex !== null && (
+            {(chaosTargetMode.type === 'BLOCK' ||
+              (chaosTargetMode.type === 'GIFT' &&
+                chaosTargetMode.step === 'PICK_TARGET' &&
+                chaosTargetMode.cardIndex !== null)) && (
               <div className="flex flex-wrap gap-2">
                 {otherActivePlayers.map((target) => (
                   <button
                     key={target.uid}
                     type="button"
                     onClick={async () => {
-                      const idx = giftMode.cardIndex!;
-                      setGiftMode(null);
+                      const mode = chaosTargetMode;
+                      setChaosTargetMode(null);
                       playActionSound(effectiveMuted);
-                      await onSendGift(target.uid, target.name, idx);
+                      if (mode.type === 'BLOCK') {
+                        await onSendBlock(target.uid, target.name);
+                      } else if (mode.cardIndex !== null) {
+                        await onSendGift(target.uid, target.name, mode.cardIndex);
+                      }
                     }}
-                    className="min-h-[44px] px-4 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-semibold text-xs flex items-center gap-2"
+                    className={`min-h-[44px] px-4 rounded-xl text-white font-semibold text-xs flex items-center gap-2 ${
+                      chaosTargetMode.type === 'BLOCK'
+                        ? 'bg-cyan-600 hover:bg-cyan-500'
+                        : 'bg-rose-500 hover:bg-rose-400'
+                    }`}
                   >
                     <span>{getAvatar(target.avatar).emoji}</span>
                     <span>{target.name}</span>
@@ -895,6 +1095,25 @@ export const GameView: React.FC<GameViewProps> = ({
             </div>
           ) : (
             <>
+              {isFrozen && (
+                <div className="rounded-2xl bg-cyan-500/20 border border-cyan-300/60 px-4 py-3 flex items-center justify-between gap-3 animate-card-pop">
+                  <div className="flex items-center gap-2.5">
+                    <Snowflake className="w-5 h-5 text-cyan-200 animate-spin shrink-0" />
+                    <div>
+                      <div className="text-sm font-bold text-cyan-100">
+                        ❄️ Eingefroren!
+                      </div>
+                      <div className="text-xs text-cyan-200">
+                        Ein Eisblock blockiert deine Karten und Eingaben noch {iceSecondsLeft} Sek.
+                      </div>
+                    </div>
+                  </div>
+                  <span className="font-mono font-extrabold text-xl text-cyan-100 tabular-nums shrink-0">
+                    {iceSecondsLeft}s
+                  </span>
+                </div>
+              )}
+
               {room.ruleVariant === 'CHAOS' && myPlayer.actionCards.length > 0 && (
                 <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
                   {myPlayer.actionCards.map((action, idx) => {
@@ -904,11 +1123,11 @@ export const GameView: React.FC<GameViewProps> = ({
                       <button
                         key={`${action}-${idx}`}
                         type="button"
-                        disabled={isPassiveShield || room.status !== 'PLAYING'}
+                        disabled={isPassiveShield || room.status !== 'PLAYING' || isFrozen}
                         onClick={() => handleActionCardClick(action)}
                         className={`min-h-[44px] px-3.5 py-2 rounded-2xl border text-left flex items-center gap-2 shrink-0 transition-transform active:scale-95 ${meta.colorClass} ${
                           isPassiveShield ? 'opacity-85 cursor-default' : ''
-                        }`}
+                        } disabled:opacity-50`}
                       >
                         <span className="text-lg">{meta.emoji}</span>
                         <div>
@@ -921,11 +1140,29 @@ export const GameView: React.FC<GameViewProps> = ({
                 </div>
               )}
 
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs text-slate-400 px-1">
+              <div
+                className={`space-y-2 rounded-2xl transition-all ${
+                  isFrozen ? 'opacity-55 ring-2 ring-cyan-400/50 p-2 bg-cyan-950/20' : ''
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 px-1">
                   <span>
-                    Deine Kartenhand ({myPlayer.cards.length}) · Zum Ablegen antippen oder sprechen
+                    Deine Kartenhand ({myPlayer.cards.length}) ·{' '}
+                    {selectedLetter
+                      ? `Karte ${selectedLetter === 'JOKER' ? '★ Joker' : selectedLetter} gewählt (erneut tippen zum Abwählen)`
+                      : 'Zum Auswählen antippen oder direkt sprechen'}
                   </span>
+                  {canUseEmergencySwap && (
+                    <button
+                      type="button"
+                      disabled={swappingCard}
+                      onClick={handleEmergencySwapClick}
+                      className="min-h-[32px] px-3 rounded-xl bg-amber-400/15 border border-amber-400/50 text-amber-300 hover:bg-amber-400/25 font-semibold text-xs flex items-center gap-1.5 transition-colors"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${swappingCard ? 'animate-spin' : ''}`} />
+                      <span>Karte tauschen (1×)</span>
+                    </button>
+                  )}
                 </div>
                 <div
                   className={`grid gap-2 ${
@@ -936,17 +1173,40 @@ export const GameView: React.FC<GameViewProps> = ({
                 >
                   {myPlayer.cards.map((letter, idx) => {
                     const palette = getLetterCardColors(letter);
+                    const isSelected = selectedCardIndex === idx;
+                    const rare = isRareLetter(letter);
                     return (
                       <button
                         key={`${letter}-${idx}`}
                         type="button"
                         disabled={
                           room.status !== 'PLAYING' ||
-                          (!isMyTurn && giftMode?.step !== 'PICK_CARD')
+                          isFrozen ||
+                          (!isMyTurn &&
+                            !(
+                              chaosTargetMode?.type === 'GIFT' &&
+                              chaosTargetMode.step === 'PICK_CARD'
+                            ))
                         }
-                        onClick={() => handleTapLetterCard(idx, letter)}
-                        className={`aspect-[3/4] rounded-2xl border-2 shadow-md flex flex-col items-center justify-center relative select-none transition-transform active:scale-95 disabled:opacity-50 ${palette.bg} ${palette.border} ${palette.text}`}
+                        onClick={() => handleTapLetterCard(idx)}
+                        className={`aspect-[3/4] rounded-2xl border-2 shadow-md flex flex-col items-center justify-center relative select-none transition-all active:scale-95 disabled:opacity-50 ${palette.bg} ${palette.border} ${palette.text} ${
+                          isSelected
+                            ? 'ring-4 ring-white shadow-xl -translate-y-1.5 scale-[1.04] z-10'
+                            : 'hover:-translate-y-0.5'
+                        }`}
                       >
+                        {rare && (
+                          <span
+                            className={`absolute top-1.5 px-1.5 py-0.5 rounded-md text-[9px] font-bold tracking-tight leading-none ${palette.badge}`}
+                          >
+                            Im Wort
+                          </span>
+                        )}
+                        {isSelected && (
+                          <span className="absolute bottom-1.5 px-1.5 py-0.5 rounded-md bg-slate-950/80 text-white text-[9px] font-bold leading-none">
+                            Aktiv
+                          </span>
+                        )}
                         {letter === 'JOKER' ? (
                           <>
                             <span className="text-3xl sm:text-4xl font-display font-extrabold leading-none">
@@ -1008,9 +1268,9 @@ export const GameView: React.FC<GameViewProps> = ({
                 disabled={!myLatestUndoableEntry}
                 onClick={() => {
                   if (!myLatestUndoableEntry) return;
-                  const norm = normalizeWord(
-                    stripGermanArticle(myLatestUndoableEntry.word)
-                  );
+                  const norm =
+                    normalizeWord(stripGermanArticle(myLatestUndoableEntry.word)) ||
+                    normalizeWord(myLatestUndoableEntry.word);
                   onUndoEntry(myLatestUndoableEntry, norm);
                 }}
                 className="min-h-[40px] px-3 rounded-xl bg-white/5 hover:bg-white/10 disabled:opacity-35 text-xs font-semibold text-slate-200 flex items-center gap-1.5 transition-colors"
@@ -1066,17 +1326,19 @@ export const GameView: React.FC<GameViewProps> = ({
                 )
               ) : (
                 <div className="px-3 py-2 rounded-xl bg-white/5 text-[11px] text-slate-400 shrink-0">
-                  Tippen oder Karte antippen
+                  Tippen zum Eingeben
                 </div>
               )}
 
               <form onSubmit={handleManualTextSubmit} className="flex-1 flex gap-1.5 min-w-0">
                 <input
+                  ref={manualInputRef}
                   type="text"
                   value={manualInput}
                   disabled={!micEnabled}
+                  maxLength={100}
                   onChange={(e) => setManualInput(e.target.value)}
-                  placeholder={interimText || 'Wort sprechen oder eintippen…'}
+                  placeholder={interimText || inputPlaceholder}
                   className="flex-1 min-w-0 min-h-[48px] px-3.5 rounded-2xl bg-[#0F1117] border border-white/15 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400 disabled:opacity-40"
                 />
                 <button

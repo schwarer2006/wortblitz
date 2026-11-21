@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Check, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react';
 import { ALL_BUILTIN_CATEGORIES } from '../data/themesAndCards';
-import { generateThemesViaProxy } from '../lib/geminiProxy';
+import { generateThemesViaProxy, getStoredFamilyPin } from '../lib/geminiProxy';
 import type { CustomDeck } from '../types/game';
 
 interface DeckBuilderModalProps {
@@ -49,11 +49,14 @@ export const DeckBuilderModal: React.FC<DeckBuilderModalProps> = ({
     setAiLoading(true);
     setAiError(null);
     try {
-      const themes = await generateThemesViaProxy(familyPin, keyword);
+      const effectivePin = familyPin.trim() || getStoredFamilyPin();
+      const themes = await generateThemesViaProxy(effectivePin, keyword);
       setAiThemes(themes);
-    } catch {
+    } catch (err) {
       setAiError(
-        'Der KI-Themengenerator ist gerade nicht erreichbar. Bitte versuche es gleich nochmal.'
+        err instanceof Error && err.message.trim()
+          ? err.message
+          : 'Der KI-Themengenerator ist gerade nicht erreichbar. Bitte versuche es gleich nochmal.'
       );
     } finally {
       setAiLoading(false);
